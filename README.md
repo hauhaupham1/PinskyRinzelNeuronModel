@@ -15,3 +15,6 @@ command in the terminal:
 python setup.py install
 ```
 The code was developed for Python 3.6.
+
+
+The code was modified, the original code is from Marte Julie (https://github.com/CINPLA/PRmodel/blob/master/PRmodel/solve_PRmodel.py)

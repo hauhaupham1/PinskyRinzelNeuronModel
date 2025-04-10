@@ -1,1 +1,1 @@
-from solve_PR_diffrax import solve_PRmodel_diffrax
+from .solve_PR_diffrax import solve_PRmodel_diffrax
