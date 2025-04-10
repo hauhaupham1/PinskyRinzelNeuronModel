@@ -131,3 +131,23 @@ def solve_PRmodel(t_dur, g_c, I_stim, stim_start, stim_end):
 
     return sol
 
+
+#Example usage
+if __name__ == "__main__":
+    t_dur = 1000.0
+    g_c = 15.0
+    I_stim = 0.5
+    stim_start = 200.0
+    stim_end = 400.0
+
+    sol = solve_PRmodel(t_dur, g_c, I_stim, stim_start, stim_end)
+
+    import matplotlib.pyplot as plt
+
+    plt.plot(sol.t, sol.y[0], label='Vs')
+    plt.plot(sol.t, sol.y[1], label='Vd')
+    plt.xlabel('Time (ms)')
+    plt.ylabel('Voltage (mV)')
+    plt.legend()
+    plt.title('Pinsky-Rinzel Model')
+    plt.show()
