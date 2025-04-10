@@ -1,0 +1,8 @@
+README.md
+setup.py
+PRmodel/__init__.py
+PRmodel/solve_PRmodel.py
+PRmodel.egg-info/PKG-INFO
+PRmodel.egg-info/SOURCES.txt
+PRmodel.egg-info/dependency_links.txt
+PRmodel.egg-info/top_level.txt
