@@ -116,7 +116,7 @@ def run_spike_adaptation(yaml_file, param_set='20230210_84'):
 
 if __name__ == "__main__":
     # Path to the YAML file
-    yaml_file = "../motoneuron.yaml"
+    yaml_file = "PRmodel_Motoneuron/motoneuron.yaml"
     
     # Run the F-I curve analysis
     currents, firing_rates, expected_rates = run_f_i_curve(yaml_file)
