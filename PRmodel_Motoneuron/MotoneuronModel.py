@@ -221,7 +221,6 @@ class MotoneuronModel(PinskyRinzel):
         else:
             results['spike_amplitudes'] = jnp.array([])
             results['mean_spike_amplitude'] = 0.0
-            
-        # Add more analysis as needed based on motoneuron.yaml targets
+        
         
         return results
