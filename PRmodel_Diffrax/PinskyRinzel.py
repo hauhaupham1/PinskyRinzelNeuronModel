@@ -1,6 +1,6 @@
 import jax
 import jax.numpy as jnp
-from diffrax import diffeqsolve, ODETerm, Dopri5, SaveAt
+from diffrax import diffeqsolve, ODETerm, Dopri5, SaveAt, RecursiveCheckpointAdjoint
 
 
 class PinskyRinzel:
@@ -170,11 +170,18 @@ class PinskyRinzel:
               stim_end=0.0,
               dt=0.05,
               saveat=None,
+              adjoint=RecursiveCheckpointAdjoint(checkpoints=10),
+              max_steps=100000,
               ):
         term = ODETerm(self.vector_field)
         solver = Dopri5()
         if saveat is None:
             saveat = SaveAt(ts=jnp.linspace(0, t_dur, int(t_dur/dt)+1))
+
+        safe_dt = jnp.maximum(dt, 1e-6)
+        # estimated_steps = int(t_dur / safe_dt * 2) + 100 # Example: double the estimated steps + buffer
+        # # Use the provided max_steps argument, ensuring it's reasonable
+        # final_max_steps = max(max_steps, estimated_steps)
 
         sol = diffeqsolve(
             term,
@@ -185,7 +192,8 @@ class PinskyRinzel:
             args=(I_stim, stim_start, stim_end),
             dt0=dt,
             saveat=saveat,
-            max_steps=None,
+            adjoint=adjoint,
+            max_steps=max_steps,
         )
         return sol
     

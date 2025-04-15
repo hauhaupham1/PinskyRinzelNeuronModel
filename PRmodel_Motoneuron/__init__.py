@@ -1,1 +1,1 @@
-from .MotoneuronModel import MotoneuronModel, run_motoneuron_example
+from .MotoneuronModel import MotoneuronModel

@@ -221,19 +221,21 @@ initial_params = {
 
 # Perform optimization with proper constraints and tiny learning rate
 learning_rate = 0.0001  # Much smaller learning rate
-print("\nPerforming 5 optimization steps with constraints...")
+print("\nPerforming 1000 optimization steps with constraints...")
 
 grad_fn = jax.grad(loss_fn)
 params = initial_params.copy()
-
-for i in range(5):
+loss_hist = []
+for i in range(1000):
     # Calculate gradients
     gradients = grad_fn(params)
-    print(f"Raw gradients: {gradients}")
+    if i % 50 == 0:
+        print(f"Raw gradients: {gradients}")
     
     # Clip gradients
     clipped_gradients = clip_gradients(gradients, max_norm=1.0)
-    print(f"Clipped gradients: {clipped_gradients}")
+    if i % 50 == 0:
+        print(f"Clipped gradients: {clipped_gradients}")
     
     # Update parameters
     for k in params:
@@ -244,8 +246,17 @@ for i in range(5):
     
     # Calculate new loss
     loss = loss_fn(params)
-    print(f"Step {i+1}, Loss: {loss}, Params: {params}")
+    loss = loss.item()
+    loss_hist.append(loss)
+    if i % 50 == 0:
+        print(f"Step {i+1}, Loss: {loss}, Params: {params}")
 
 # Plot final simulation
 print("\nFinal simulation after optimization:")
 sol = plot_simulation(params)
+plt.plot(loss_hist)
+plt.xlabel('Optimization Step')
+plt.ylabel('Loss')
+plt.title('Loss History')
+plt.savefig('loss_history.png')
+plt.show()
