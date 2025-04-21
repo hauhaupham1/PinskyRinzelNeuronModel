@@ -1,10 +1,11 @@
 import jax
 import jax.numpy as jnp
-from diffrax import diffeqsolve, ODETerm, Dopri5, SaveAt
-
+from diffrax import diffeqsolve, ODETerm, Dopri5, SaveAt, Event
+import optimistix
+import functools as ft
 
 class MotoneuronNetwork:
-    def __init__(self, num_neurons: int, connections = None):
+    def __init__(self, num_neurons: int, connections = None, threshold: float = -20.0):
         self.num_neurons = num_neurons
 
         if connections is None:
@@ -54,6 +55,25 @@ class MotoneuronNetwork:
             'kCa_Caconc': self.kCa_Caconc,
         }
         self.initial_state = self._initialize_state()
+        self.threshold = threshold
+        def make_cond_fn(neuron_idx):
+            def _cond_fn(t, y, args, **kwargs):
+                # reshape to (state_vars, num_neurons) and detect when soma voltage crosses threshold
+                y_reshaped = y.reshape(8, self.num_neurons)
+                Vs = y_reshaped[0, neuron_idx]
+                return Vs - self.threshold
+            return _cond_fn
+        
+        self.cond_fn = [make_cond_fn(n) for n in range(self.num_neurons)]
+            
+        # Create the event for spike detection
+        self.event = Event(
+            cond_fn=self.cond_fn,
+            root_finder=optimistix.Newton(
+                rtol=1e-5,
+                atol=1e-5
+            )
+        )
       
     def _initialize_state(self):
         """Initialize state variables for all neurons."""
@@ -218,7 +238,8 @@ class MotoneuronNetwork:
         # Configure save points
         saveat = SaveAt(ts=jnp.linspace(0, t_dur, int(t_dur/dt) + 1))
         
-        # Solve the system
+        # attach spike-detection event
+        root_finder = optimistix.Newton(1e-5, 1e-5, optimistix.rms_norm)
         sol = diffeqsolve(
             term,
             solver,
@@ -228,6 +249,7 @@ class MotoneuronNetwork:
             y0=self.initial_state,
             args=(I_stim, stim_start, stim_end),
             saveat=saveat,
+            event=self.event,
             max_steps=max_steps
         )
         return sol
@@ -239,15 +261,15 @@ class MotoneuronNetwork:
 if __name__ == "__main__":
     # Create a model with default parameters
     num_neurons = 2
-    model = MotoneuronNetwork(num_neurons, connections=jnp.array([[0, 0.5], [0, 0]]))
+    model = MotoneuronNetwork(num_neurons, connections=jnp.array([[0, 0.5], [0, 0]]), threshold=-37.0)
     
     # Solve the system
     t_dur = 100.0
-    I_stim = jnp.array([1, 0])
+    I_stim = jnp.array([0, 1])
     stim_start = jnp.zeros(num_neurons)
     stim_end = jnp.ones(num_neurons) * 50.0
     
     sol = model.solve(t_dur, I_stim, stim_start, stim_end)
     
     # Print the solution
-    print(sol.ys[-1])
+    print(sol.event_mask)
