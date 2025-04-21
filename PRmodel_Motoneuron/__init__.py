@@ -1,4 +1,4 @@
-from .MotoneuronModel import MotoneuronModel
+from .MotoneuronModel import MotoneuronModel, Network
 from .losses import (
     load_target_values,
     range_loss,

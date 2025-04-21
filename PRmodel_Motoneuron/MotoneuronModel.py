@@ -17,7 +17,7 @@ class MotoneuronModel(PinskyRinzel):
 
     def __init__(self, 
                  yaml_file=None,
-                 param_set=20230210_84,
+                 param_set='20230210_84',
                  **kwargs):
         """
         Initialize the motoneuron model with parameters from a YAML file.
@@ -74,12 +74,6 @@ class MotoneuronModel(PinskyRinzel):
             E_K=self.params['E_K'],
             E_Ca=self.params['E_Ca'],
         )
-        if hasattr(self, 'v_init'):
-        # Replace the first two elements (Vs, Vd) with v_init
-            init_state = list(self.initial_state)
-            init_state[0] = self.v_init  # Set soma voltage
-            init_state[1] = self.v_init  # Set dendrite voltage
-            self.initial_state = jnp.array(init_state)
         
         # Store any additional parameters specific to motoneuron model
         self.f_Caconc = self.params['f_Caconc']
@@ -99,11 +93,6 @@ class MotoneuronModel(PinskyRinzel):
         try:
             with open(yaml_file, 'r') as f:
                 yaml_data = yaml.safe_load(f)
-            
-
-            if 'Numerics' in yaml_data:
-                numerics = yaml_data['Numerics']
-                self.v_init = numerics.get('v_init', -68.0)
             
             # Load default parameters from yaml file
             if 'Parameters' in yaml_data:
