@@ -243,7 +243,7 @@ class MotoneuronNetwork:
         sol = None
         while t0_current < t_dur:
             prev_t0 = t0_current
-            # Configure save points for this segment: only times from t0_current to t_dur
+            #save points for this segment: times from t0_current to t_dur
             n_steps = int((t_dur - t0_current) / dt)
             ts_loop = jnp.linspace(t0_current, t_dur, n_steps + 1)
             # include controller_state for warm-start
@@ -298,9 +298,8 @@ class MotoneuronNetwork:
                 solver_state = None
         return sol
     
-#Example usage
+#example usage
 if __name__ == "__main__":
-    # Create a model with default parameters
     num_neurons = 2
     connections=jnp.array([[0, 0.5], [0, 0]], dtype=jnp.float32)
     model = MotoneuronNetwork(num_neurons, connections=connections, threshold=-37.0)
