@@ -304,4 +304,6 @@ if __name__ == "__main__":
     
     # Print the solution
     print(sol.event_mask)
-    print(neuron_idx = jnp.atleast_1d(jnp.where(sol.event_mask[0] == 1)[0]))
+    true_indices = jnp.where(jnp.array([bool(em) for em in sol.event_mask]))[0]
+    true_index = true_indices[0]
+    print(true_index)
