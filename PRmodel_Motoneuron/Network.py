@@ -1,6 +1,6 @@
 import jax
 import jax.numpy as jnp
-from diffrax import diffeqsolve, ODETerm, Dopri5, SaveAt, Event
+from diffrax import diffeqsolve, ODETerm, Dopri5, SaveAt, Event, RESULTS
 import optimistix
 import functools as ft
 
@@ -235,28 +235,59 @@ class MotoneuronNetwork:
         term = ODETerm(self.vector_field)
         solver = Dopri5()
         
-        # Configure save points
-        saveat = SaveAt(ts=jnp.linspace(0, t_dur, int(t_dur/dt) + 1))
-        
-        # attach spike-detection event
-        root_finder = optimistix.Newton(1e-5, 1e-5, optimistix.rms_norm)
-        sol = diffeqsolve(
-            term,
-            solver,
-            t0=0,
-            t1=t_dur,
-            dt0=dt,
-            y0=self.initial_state,
-            args=(I_stim, stim_start, stim_end),
-            saveat=saveat,
-            event=self.event,
-            max_steps=max_steps
-        )
+        # Warm-start integration loop: continue until full duration
+        solver_state = None
+        made_jump = None
+        controller_state = None
+        t0_current = 0.0
+        y0_current = self.initial_state
+        sol = None
+        while t0_current < t_dur:
+            prev_t0 = t0_current
+            # Configure save points for this segment: only times from t0_current to t_dur
+            n_steps = int((t_dur - t0_current) / dt)
+            ts_loop = jnp.linspace(t0_current, t_dur, n_steps + 1)
+            # include controller_state for warm-start
+            saveat = SaveAt(ts=ts_loop, solver_state=True, controller_state=True, made_jump=True)
+            sol = diffeqsolve(
+                term,
+                solver,
+                t0=t0_current,
+                t1=t_dur,
+                dt0=dt,
+                y0=y0_current,
+                args=(I_stim, stim_start, stim_end),
+                saveat=saveat,
+                event=self.event,
+                max_steps=max_steps,
+                solver_state=solver_state,
+                controller_state=controller_state,
+                made_jump=made_jump
+            )
+            # If solve did not end on an event (i.e., reached t_dur), break out
+            if sol.result != RESULTS.event_occurred:
+                break
+            #Update the current time and state
+            ts_arr = sol.ts
+            finite_ts = ts_arr[jnp.isfinite(ts_arr)]
+            t_last = float(finite_ts[-1])
+            if t_last <= prev_t0:
+                # no progression
+                break
+            t0_current = t_last
+            ys_arr = sol.ys
+            finite_ys = ys_arr[: finite_ts.shape[0]]
+            y0_current = finite_ys[-1]
+            solver_state = sol.solver_state
+            controller_state = sol.controller_state
+            made_jump = sol.made_jump
+
+            #Propagate the weights if a spike occurred
+            if sol.result == RESULTS.event_occurred:
+                # Index of the neuron that spiked
+                pass
         return sol
-
-
-
-
+    
 #Example usage
 if __name__ == "__main__":
     # Create a model with default parameters
@@ -273,3 +304,4 @@ if __name__ == "__main__":
     
     # Print the solution
     print(sol.event_mask)
+    print(neuron_idx = jnp.atleast_1d(jnp.where(sol.event_mask[0] == 1)[0]))
