@@ -207,7 +207,7 @@ class MotoneuronNetwork:
         I_stim, stim_start, stim_end = args
         def input_current_fn(t):
             stim = jnp.where((t>stim_start)&(t<stim_end), I_stim/self.p, jnp.zeros_like(I_stim))
-            return stim + jnp.dot(self.connections, stim)
+            return stim #+ jnp.dot(self.connections, stim) only apply the external current
         # delegate to vmapped drift_vf
         return self.drift_vf(t, y, input_current_fn)
     
@@ -234,7 +234,6 @@ class MotoneuronNetwork:
             stim_end = jnp.ones(self.num_neurons) * stim_end
         term = ODETerm(self.vector_field)
         solver = Dopri5()
-        
         # Warm-start integration loop: continue until full duration
         solver_state = None
         made_jump = None
@@ -285,14 +284,26 @@ class MotoneuronNetwork:
             #Propagate the weights if a spike occurred
             if sol.result == RESULTS.event_occurred:
                 # Index of the neuron that spiked
-                pass
+                true_indices = jnp.where(jnp.array([bool(em) for em in sol.event_mask]))[0]
+                true_index = true_indices[0]
+                #Get the connected neurons index
+                #array of connected neurons is the row of the connections matrix
+                connected_neurons = self.connections[true_index]
+                #the weights are the value of the connections matrix
+                #now increase the weights of the connected neurons
+                I_stim = I_stim + connected_neurons
+                # reset the state of the neuron that spiked using JAX index update
+                y0_current = y0_current.at[:8, true_index].set(self.initial_state[:8, true_index])
+                #reset solver_state
+                solver_state = None
         return sol
     
 #Example usage
 if __name__ == "__main__":
     # Create a model with default parameters
     num_neurons = 2
-    model = MotoneuronNetwork(num_neurons, connections=jnp.array([[0, 0.5], [0, 0]]), threshold=-37.0)
+    connections=jnp.array([[0, 0.5], [0, 0]], dtype=jnp.float32)
+    model = MotoneuronNetwork(num_neurons, connections=connections, threshold=-37.0)
     
     # Solve the system
     t_dur = 100.0
@@ -304,6 +315,4 @@ if __name__ == "__main__":
     
     # Print the solution
     print(sol.event_mask)
-    true_indices = jnp.where(jnp.array([bool(em) for em in sol.event_mask]))[0]
-    true_index = true_indices[0]
-    print(true_index)
+    print(sol.ys[-1])
