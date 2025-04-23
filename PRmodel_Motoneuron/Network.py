@@ -1,17 +1,19 @@
 import jax
 import jax.numpy as jnp
 from diffrax import diffeqsolve, ODETerm, Dopri5, SaveAt, Event, RESULTS
+from jax.ops import segment_sum
 import optimistix
 import functools as ft
+import scipy.sparse as sp
 
 class MotoneuronNetwork:
     def __init__(self, num_neurons: int, connections = None, threshold: float = -20.0):
         self.num_neurons = num_neurons
 
-        if connections is None:
-            self.connections = jax.numpy.zeros((num_neurons, num_neurons))
-        else:
-            self.connections = connections
+        COO = sp.coo_matrix(connections)
+        self.pre = COO.row
+        self.post = COO.col
+        self.w = COO.data
 
         self.C_m = jnp.ones(num_neurons) * 2.0        # global_cm
         self.p = jnp.ones(num_neurons) * 0.1           # pp
@@ -241,6 +243,7 @@ class MotoneuronNetwork:
         t0_current = 0.0
         y0_current = self.initial_state
         sol = None
+      
         while t0_current < t_dur:
             prev_t0 = t0_current
             #save points for this segment: times from t0_current to t_dur
@@ -280,38 +283,78 @@ class MotoneuronNetwork:
             solver_state = sol.solver_state
             controller_state = sol.controller_state
             made_jump = sol.made_jump
-
             #Propagate the weights if a spike occurred
             if sol.result == RESULTS.event_occurred:
-                # Index of the neuron that spiked
-                true_indices = jnp.where(jnp.array([bool(em) for em in sol.event_mask]))[0]
-                true_index = true_indices[0]
-                #Get the connected neurons index
-                #array of connected neurons is the row of the connections matrix
-                connected_neurons = self.connections[true_index]
-                #the weights are the value of the connections matrix
-                #now increase the weights of the connected neurons
-                I_stim = I_stim + connected_neurons
-                # reset the state of the neuron that spiked using JAX index update
-                y0_current = y0_current.at[:8, true_index].set(self.initial_state[:8, true_index])
+                # # Index of the neuron that spiked
+                # true_indices = jnp.where(jnp.array([bool(em) for em in sol.event_mask]))[0]
+                # print(sol.event_mask)
+                # print("true_indices", true_indices)
+                # true_index = true_indices[0]
+                # #Get the connected neurons index
+                # #array of connected neurons is the row of the connections matrix
+                # connected_neurons = self.connections[true_index]
+                # #the weights are the value of the connections matrix
+                # #now increase the weights of the connected neurons
+                # I_stim = I_stim + connected_neurons
+                # # reset the state of the neuron that spiked using JAX index update
+                # y0_current = y0_current.at[:8, true_index].set(self.initial_state[:8, true_index])
+                # #reset solver_state
+                # solver_state = None
+
+                #manually check which neuron crossed the threshold
+
+
+                #Spike process and get the indices of the neurons that spiked
+                #1e-2 tolerance
+                spike_mask = jnp.abs(y0_current[0] - self.threshold) < 1e-2
+                indices = jnp.where(spike_mask)[0]
+                pre_indices = jnp.where(jnp.isin(self.pre, indices))[0]
+                pre_idx = self.pre[pre_indices]
+                post_idx = self.post[pre_indices]
+                weights = self.w[pre_indices]
+
+                ################################
+                # update I_stim for all postsynaptic targets of the spiking pre neurons
+                weights = self.w[pre_indices]
+                dI = segment_sum(weights, post_idx, num_segments=self.num_neurons)
+                # print("dI", dI)
+                I_stim = I_stim + dI
+                # print("I_stim", I_stim)
+
+                # print('y0_current', y0_current)
+
+                #reset the state of the neuron that spiked
+                y0_current = y0_current.at[:8, indices].set(self.initial_state[:8, indices])
+                # print('y0_current', y0_current)
                 #reset solver_state
                 solver_state = None
+
         return sol
     
 #example usage
 if __name__ == "__main__":
-    num_neurons = 2
-    connections=jnp.array([[0, 0.5], [0, 0]], dtype=jnp.float32)
+    num_neurons = 3
+    connections = jnp.array([
+     [0.0, 0.5, 0.0],
+     [0.2, 0.0, 0.1],
+     [0.5, 0.5, 0.0],
+   ]) 
     model = MotoneuronNetwork(num_neurons, connections=connections, threshold=-37.0)
     
-    # Solve the system
+    # # Solve the system
     t_dur = 100.0
-    I_stim = jnp.array([0, 1])
+    I_stim = jnp.array([0, 1, 1])
     stim_start = jnp.zeros(num_neurons)
     stim_end = jnp.ones(num_neurons) * 50.0
     
     sol = model.solve(t_dur, I_stim, stim_start, stim_end)
     
     # Print the solution
-    print(sol.event_mask)
-    print(sol.ys[-1])
+    # print(sol.event_mask)
+    # print(sol.ys[-1])
+    # print("Spike times:", sol.ts)
+    # print("Spike times:", spike_time)
+
+
+
+
