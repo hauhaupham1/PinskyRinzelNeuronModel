@@ -58,16 +58,28 @@ class MotoneuronNetwork:
         }
         self.initial_state = self._initialize_state()
         self.threshold = threshold
-        def make_cond_fn(neuron_idx):
-            def _cond_fn(t, y, args, **kwargs):
-                # reshape to (state_vars, num_neurons) and detect when soma voltage crosses threshold
-                y_reshaped = y.reshape(8, self.num_neurons)
-                Vs = y_reshaped[0, neuron_idx]
-                return Vs - self.threshold
-            return _cond_fn
+        # def make_cond_fn(neuron_idx):
+        #     def _cond_fn(t, y, args, **kwargs):
+        #         # reshape to (state_vars, num_neurons) and detect when soma voltage crosses threshold
+        #         y_reshaped = y.reshape(8, self.num_neurons)
+        #         Vs = y_reshaped[0, neuron_idx]
+        #         return Vs - self.threshold
+        #     return _cond_fn
         
-        self.cond_fn = [make_cond_fn(n) for n in range(self.num_neurons)]
+        # self.cond_fn = [make_cond_fn(n) for n in range(self.num_neurons)]
             
+        
+
+        def cond_fn(t, y, args, n, **kwargs):
+            # y_reshaped = y.reshape(8, self.num_neurons)
+            Vs = y[0, n]
+            return Vs - self.threshold
+
+
+        self.cond_fn = [
+            ft.partial(cond_fn, n=n) for n in range(self.num_neurons)
+        ]
+
         # Create the event for spike detection
         self.event = Event(
             cond_fn=self.cond_fn,
@@ -329,6 +341,10 @@ class MotoneuronNetwork:
                 #reset solver_state
                 solver_state = None
 
+
+                #print event.mask
+                print("Event mask", sol.event_mask)
+
         return sol
     
 #example usage
@@ -343,7 +359,7 @@ if __name__ == "__main__":
     
     # # Solve the system
     t_dur = 100.0
-    I_stim = jnp.array([0, 1, 1])
+    I_stim = jnp.array([1, 1, 1])
     stim_start = jnp.zeros(num_neurons)
     stim_end = jnp.ones(num_neurons) * 50.0
     
