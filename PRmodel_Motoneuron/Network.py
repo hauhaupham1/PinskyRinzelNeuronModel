@@ -1,19 +1,23 @@
 import jax
 import jax.numpy as jnp
-from diffrax import diffeqsolve, ODETerm, Dopri5, SaveAt, Event, RESULTS
+from diffrax import diffeqsolve, ODETerm, Dopri5, SaveAt, Event, RESULTS, RecursiveCheckpointAdjoint
 from jax.ops import segment_sum
 import optimistix
 import functools as ft
 import scipy.sparse as sp
+import jax.scipy as jsp
 
 class MotoneuronNetwork:
-    def __init__(self, num_neurons: int, connections = None, threshold: float = -20.0):
+    def __init__(self, num_neurons: int, pre: jnp.ndarray, post: jnp.ndarray, w: jnp.ndarray, threshold: float = -20.0):
         self.num_neurons = num_neurons
 
-        COO = sp.coo_matrix(connections)
-        self.pre = COO.row
-        self.post = COO.col
-        self.w = COO.data
+        # COO = sp.coo_matrix(connections)
+        # self.pre = COO.row
+        # self.post = COO.col
+        # self.w = COO.data
+        self.pre = pre
+        self.post = post
+        self.w = w
 
         self.C_m = jnp.ones(num_neurons) * 2.0        # global_cm
         self.p = jnp.ones(num_neurons) * 0.1           # pp
@@ -58,6 +62,8 @@ class MotoneuronNetwork:
         }
         self.initial_state = self._initialize_state()
         self.threshold = threshold
+
+
         # def make_cond_fn(neuron_idx):
         #     def _cond_fn(t, y, args, **kwargs):
         #         # reshape to (state_vars, num_neurons) and detect when soma voltage crosses threshold
@@ -276,7 +282,8 @@ class MotoneuronNetwork:
                 max_steps=max_steps,
                 solver_state=solver_state,
                 controller_state=controller_state,
-                made_jump=made_jump
+                made_jump=made_jump,
+                adjoint=RecursiveCheckpointAdjoint(1000),
             )
             # If solve did not end on an event (i.e., reached t_dur), break out
             if sol.result != RESULTS.event_occurred:
@@ -357,7 +364,7 @@ if __name__ == "__main__":
    ]) 
     model = MotoneuronNetwork(num_neurons, connections=connections, threshold=-37.0)
     
-    # # Solve the system
+    # Solve the system
     t_dur = 100.0
     I_stim = jnp.array([1, 1, 1])
     stim_start = jnp.zeros(num_neurons)
@@ -365,7 +372,6 @@ if __name__ == "__main__":
     
     sol = model.solve(t_dur, I_stim, stim_start, stim_end)
     
-    # Print the solution
     # print(sol.event_mask)
     # print(sol.ys[-1])
     # print("Spike times:", sol.ts)
