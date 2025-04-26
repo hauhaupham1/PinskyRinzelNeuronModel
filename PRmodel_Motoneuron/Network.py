@@ -1,11 +1,21 @@
+import functools as ft
+from typing import Any, Callable, List, Optional, Sequence
+
+import diffrax
+import equinox as eqx
+import equinox.internal as eqxi
 import jax
 import jax.numpy as jnp
-from diffrax import diffeqsolve, ODETerm, Dopri5, SaveAt, Event, RESULTS, RecursiveCheckpointAdjoint
+import jax.random as jr
+import numpy as np
+import optimistix 
+from jax._src.ad_util import stop_gradient_p  # pyright: ignore
+from jax.interpreters import ad
+from jax.typing import ArrayLike
+from jaxtyping import Array, Bool, Float, Int, Real
+from diffrax import ODETerm, SaveAt, Dopri5, diffeqsolve, RESULTS, RecursiveCheckpointAdjoint, Event
 from jax.ops import segment_sum
-import optimistix
-import functools as ft
-import scipy.sparse as sp
-import jax.scipy as jsp
+
 
 class MotoneuronNetwork:
     def __init__(self, num_neurons: int, pre: jnp.ndarray, post: jnp.ndarray, w: jnp.ndarray, threshold: float = -20.0):
@@ -350,11 +360,12 @@ class MotoneuronNetwork:
 
 
                 #print event.mask
-                print("Event mask", sol.event_mask)
+                # print("Event mask", sol.event_mask)
 
         return sol
     
 #example usage
+import scipy.sparse as sp
 if __name__ == "__main__":
     num_neurons = 3
     connections = jnp.array([
@@ -362,7 +373,13 @@ if __name__ == "__main__":
      [0.2, 0.0, 0.1],
      [0.5, 0.5, 0.0],
    ]) 
-    model = MotoneuronNetwork(num_neurons, connections=connections, threshold=-37.0)
+    
+    COO = sp.coo_matrix(connections)
+
+    pre = jnp.array(COO.row)
+    post = jnp.array(COO.col)
+    data = jnp.array(COO.data)
+    model = MotoneuronNetwork(num_neurons, pre=pre, post=post, w=data, threshold=-37.0)
     
     # Solve the system
     t_dur = 100.0
