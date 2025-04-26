@@ -410,11 +410,17 @@ class MotoneuronNetwork(eqx.Module):
         # Define transition function to reset state after spikes
         @jax.vmap
         def trans_fn(y, event, key):
-            # y: state vector for one neuron, event: bool flag if that neuron spiked
             Vs, Vd, n, h, s, c, q, Ca = y
+            # reset all state variables upon spike event
             Vs_out = jnp.where(event, self.v_reset, Vs)
-            # keep other state variables unchanged
-            return jnp.stack([Vs_out, Vd, n, h, s, c, q, Ca], axis=-1)
+            Vd_out = jnp.where(event, self.v_reset, Vd)
+            n_out  = jnp.where(event, 0.001, n)
+            h_out  = jnp.where(event, 0.999, h)
+            s_out  = jnp.where(event, 0.009, s)
+            c_out  = jnp.where(event, 0.007, c)
+            q_out  = jnp.where(event, 0.01, q)
+            Ca_out = jnp.where(event, 0.2, Ca)
+            return jnp.stack([Vs_out, Vd_out, n_out, h_out, s_out, c_out, q_out, Ca_out], axis=-1)
 
         # Main simulation loop
         def body_fun(state: NetworkState) -> NetworkState:
@@ -498,7 +504,7 @@ class MotoneuronNetwork(eqx.Module):
                 yevent = eqxi.error_if(yevent, jnp.any(jnp.isinf(yevent)), "yevent is inf")
                 
                 # Determine which neurons spiked
-                event_array = jnp.array(yevent[:, 0] > self.threshold)
+                event_array = jnp.array(yevent[:, 0] > self.threshold - 1e-3)
                 w_update_t = jnp.where(
                     jnp.tile(event_array, (self.num_neurons, 1)).T, w_update, 0.0
                 ).T
@@ -520,11 +526,17 @@ class MotoneuronNetwork(eqx.Module):
             # Increment spike counter
             num_spikes = state.num_spikes + 1
             
-            # Store results
-            ts = state.ts.at[:, state.num_spikes].set(_ts)
-            ys = state.ys.at[:, state.num_spikes].set(_ys)
-            event_types = state.event_types.at[:, state.num_spikes].set(event_mask)
-            tevents = state.tevents.at[:, state.num_spikes].set(tevent)
+            ts = state.ts
+            ts = ts.at[:, state.num_spikes].set(_ts)
+
+            ys = state.ys
+            ys = ys.at[:, state.num_spikes].set(_ys)
+
+            event_types = state.event_types
+            event_types = event_types.at[:, state.num_spikes].set(event_mask)
+
+            tevents = state.tevents
+            tevents = tevents.at[:, state.num_spikes].set(tevent)
             
             # Return new state
             new_state = NetworkState(
@@ -578,28 +590,46 @@ class MotoneuronNetwork(eqx.Module):
 
 if __name__ == "__main__":
     # Define the network structure
-    num_neurons = 2
+    num_neurons = 3
+    network = jnp.array([[0, 1, 0], 
+                         [1, 0, 1], 
+                         [1, 1, 0]], dtype=bool)
+    
+    weright_matrix = jnp.array([[0.0, 0.5, 0.0],
+                                [0.2, 0.0, 0.1],
+                                [0.5, 0.5, 0.0],])
+    
 
-    # Create the network
-    network_model = MotoneuronNetwork(num_neurons=num_neurons, threshold=-37.0)
-
-    # Define a simple input current function
-    I_stim = jnp.array([3, 3])  # Example input current
-    stim_start = 1
-    stim_end = 10
-
+    t_dur = 100
+    I_stim = jnp.array([0.5, 1, 1])
+    stim_start = jnp.zeros(num_neurons)
+    stim_end = jnp.ones(num_neurons) * 50.0
     def input_current(t):
-        stim = jnp.where((t>stim_start)&(t<stim_end), I_stim/0.1, jnp.zeros_like(I_stim))
-        return I_stim 
+            stim = jnp.where((t>stim_start)&(t<stim_end), (I_stim/0.1), jnp.zeros_like(I_stim))
+            return stim
+    
+    # Initialize the network
+    network_model = MotoneuronNetwork(
+        num_neurons=3,
+        v_reset=-60.0,
+        threshold=-37.0,
+        w=weright_matrix,
+        network=network
+    )
 
-    # Run the simulation
-    t_dur = 10
-    max_spikes = 1
-    num_samples = 1
+    sol = network_model(
+        input_current, 
+        t0=0.0, 
+        t1=100.0, 
+        max_spikes=10, 
+        num_samples=1, 
+        key=jr.PRNGKey(0),
+        dt0=0.01
+    )
 
-    sol = network_model(input_current=input_current, t0=0.0, t1=t_dur, max_spikes=max_spikes, num_samples=num_samples, key=jax.random.PRNGKey(0))
-
-    # Print the results
-    print(sol.ys)
-    print(sol.ts)
-    print(sol.num_spikes)
+    print(sol.spike_marks)
+    for k in range(sol.num_spikes):
+        fired_mask   = sol.spike_marks[0, k]       # shape (neurons,)
+        fired_neurons = jnp.where(fired_mask)[0]   # now non‐empty
+        t_k          = sol.spike_times[0, k]
+        print(f"Spike #{k} at t={t_k:.3f} ms by neurons {list(fired_neurons)}")
