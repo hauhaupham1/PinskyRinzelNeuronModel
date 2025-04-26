@@ -17,39 +17,103 @@ from diffrax import ODETerm, SaveAt, Dopri5, diffeqsolve, RESULTS, RecursiveChec
 from jax.ops import segment_sum
 
 
-class MotoneuronNetwork:
-    def __init__(self, num_neurons: int, pre: jnp.ndarray, post: jnp.ndarray, w: jnp.ndarray, threshold: float = -20.0):
+class Solution(eqx.Module):
+    """Solution of the event-driven model."""
+
+    t1: Real
+    ys: Float[Array, "samples spikes neurons times 3"]
+    ts: Float[Array, "samples spikes neurons times"]
+    spike_times: Float[Array, "samples spikes"]
+    spike_marks: Float[Array, "samples spikes neurons"]
+    num_spikes: int
+    max_spikes: int
+
+
+def _build_w(w, network, key, minval, maxval):
+    if w is not None:
+        return w
+    w_a = jr.uniform(key, network.shape, minval=minval, maxval=maxval)
+    return w_a.at[network].set(0.0)
+
+
+class NetworkState(eqx.Module):
+    ts: Real[Array, "samples spikes times"]
+    ys: Float[Array, "samples spikes neurons times 3"]
+    tevents: eqxi.MaybeBuffer[Real[Array, "samples spikes"]]
+    t0: Real[Array, " samples"]
+    y0: Float[Array, "samples neurons 3"]
+    num_spikes: int
+    event_mask: Bool[Array, "samples neurons"]
+    event_types: eqxi.MaybeBuffer[Bool[Array, "samples spikes neurons"]]
+
+def buffers(state: NetworkState):
+    assert type(state) is NetworkState
+    return state.tevents, state.ts, state.ys, state.event_types
+
+class MotoneuronNetwork(eqx.Module):
+    num_neurons: Int
+    w: Float[Array, "neurons neurons"]
+    network: Bool[ArrayLike, "neurons neurons"] = eqx.field(static=True)
+    threshold: float
+    v_reset: float = -60.0
+    drift_vf: Callable[..., Float[ArrayLike, "neurons 8"]]
+    C_m: Float
+    p: Float
+    g_c: Float
+    g_L_soma: Float
+    g_L_dend: Float
+    g_Na: Float
+    g_DR: Float
+    g_Ca: Float
+    g_AHP: Float
+    g_C: Float
+    E_L: Float
+    E_Na: Float
+    E_K: Float
+    E_Ca: Float
+    f_Caconc: Float
+    alpha_Caconc: Float
+    kCa_Caconc: Float
+    params: dict
+    initial_state: Float[Array, "neurons 8"]
+    cond_fn: List[Callable[..., Float]]
+
+    def __init__(self, 
+                 num_neurons: Int, 
+                 w: Optional[Float[Array, "neurons neurons"]] = None,
+                 network: Optional[Bool[ArrayLike, "neurons neurons"]] = None,
+                 threshold: float = -20.0):
+        
         self.num_neurons = num_neurons
+        if network is None:
+            network = np.full((num_neurons, num_neurons), False)
 
-        # COO = sp.coo_matrix(connections)
-        # self.pre = COO.row
-        # self.post = COO.col
-        # self.w = COO.data
-        self.pre = pre
-        self.post = post
-        self.w = w
+        w_key = jr.PRNGKey(0)
+        wmin = 0.0
+        wmax = 0.5
 
-        self.C_m = jnp.ones(num_neurons) * 2.0        # global_cm
-        self.p = jnp.ones(num_neurons) * 0.1           # pp
-        self.g_c = jnp.ones(num_neurons) * 0.4185837  # gc
-        self.g_L_soma = jnp.ones(num_neurons) * 0.00036572208  # soma_g_pas
-        self.g_L_dend = jnp.ones(num_neurons) * 1.0e-05  # dend_g_pas
-        self.g_Na = jnp.ones(num_neurons) * 0.2742448  # soma_gmax_Na
-        self.g_DR = jnp.ones(num_neurons) * 0.23978254  # soma_gmax_K
-        self.g_Ca = jnp.ones(num_neurons) * 0.0077317934  # soma_gmax_CaN
-        self.g_AHP = jnp.ones(num_neurons) * 0.005  # dend_gmax_KCa
-        self.g_C = jnp.ones(num_neurons) * 0.009327445  # soma_gmax_KCa
-        
+        self.w = _build_w(w, network, w_key, wmin, wmax)
+        self.network = network
+
+        self.C_m      = 2.0        # global_cm
+        self.p        = 0.1           # pp
+        self.g_c      = 0.4185837  # gc
+        self.g_L_soma = 0.00036572208  # soma_g_pas
+        self.g_L_dend = 1.0e-05  # dend_g_pas
+        self.g_Na     = 0.2742448  # soma_gmax_Na
+        self.g_DR     = 0.23978254  # soma_gmax_K
+        self.g_Ca     = 0.0077317934  # soma_gmax_CaN
+        self.g_AHP    = 0.005  # dend_gmax_KCa
+        self.g_C      = 0.009327445  # soma_gmax_KCa
         # Reversal potentials
-        self.E_L = jnp.ones(num_neurons) * -62.0  # e_pas
-        self.E_Na = jnp.ones(num_neurons) * 60.0
-        self.E_K = jnp.ones(num_neurons) * -75.0
-        self.E_Ca = jnp.ones(num_neurons) * 80.0
-        
+        self.E_L      = -62.0  # e_pas
+        self.E_Na     = 60.0
+        self.E_K      = -75.0
+        self.E_Ca     = 80.0
         # Calcium dynamics
-        self.f_Caconc = jnp.ones(num_neurons) * 0.004  # soma_f_Caconc
-        self.alpha_Caconc = jnp.ones(num_neurons) * 1.0  # soma_alpha_Caconc
-        self.kCa_Caconc = jnp.ones(num_neurons) * 8.0  # soma_kCa_Caconc
+        self.f_Caconc     = 0.004  # soma_f_Caconc
+        self.alpha_Caconc = 1.0  # soma_alpha_Caconc
+        self.kCa_Caconc   = 8.0  # soma_kCa_Caconc
 
         self.params = {
             'C_m': self.C_m,
@@ -96,19 +160,126 @@ class MotoneuronNetwork:
             ft.partial(cond_fn, n=n) for n in range(self.num_neurons)
         ]
 
-        # Create the event for spike detection
-        self.event = Event(
-            cond_fn=self.cond_fn,
-            root_finder=optimistix.Newton(
-                rtol=1e-5,
-                atol=1e-5
+        
+        def alpha_m(Vs):
+            """Na+ channel activation rate"""
+            V1 = Vs + 46.9
+            alpha = -0.32 * V1 / (jnp.exp(-V1 / 4.) - 1.)
+            return alpha
+
+        def beta_m(Vs):
+            """Na+ channel deactivation rate"""
+            V2 = Vs + 19.9
+            beta = 0.28 * V2 / (jnp.exp(V2 / 5.) - 1.)
+            return beta
+
+        def alpha_h(Vs):
+            """Na+ channel inactivation rate"""
+            alpha = 0.128 * jnp.exp((-43. - Vs) / 18.)
+            return alpha
+
+        def beta_h(Vs):
+            """Na+ channel deinactivation rate"""
+            V5 = Vs + 20.
+            beta = 4. / (1 + jnp.exp(-V5 / 5.))
+            return beta
+
+        def alpha_n(Vs):
+            """K+ delayed rectifier activation rate"""
+            V3 = Vs + 24.9
+            alpha = -0.016 * V3 / (jnp.exp(-V3 / 5.) - 1)
+            return alpha
+
+        def beta_n(Vs):
+            """K+ delayed rectifier deactivation rate"""
+            V4 = Vs + 40.
+            beta = 0.25 * jnp.exp(-V4 / 40.)
+            return beta
+
+        def alpha_s(Vd):
+            """Ca2+ channel activation rate"""
+            alpha = 1.6 / (1 + jnp.exp(-0.072 * (Vd-5.)))
+            return alpha
+
+        def beta_s(Vd):
+            """Ca2+ channel deactivation rate"""
+            V6 = Vd + 8.9
+            beta = 0.02 * V6 / (jnp.exp(V6 / 5.) - 1.)
+            return beta
+
+        def alpha_c(Vd):
+            """Ca-dependent K+ channel activation rate"""
+            V7 = Vd + 53.5
+            V8 = Vd + 50.
+            return jnp.where(
+                Vd <= -10,
+                0.0527 * jnp.exp(V8/11. - V7/27.),
+                2 * jnp.exp(-V7 / 27.)
             )
-        )
-      
+
+        def beta_c(Vd):
+            """Ca-dependent K+ channel deactivation rate"""
+            V7 = Vd + 53.5
+            alpha_c_val = alpha_c(Vd)
+            return jnp.where(
+                Vd <= -10,
+                2. * jnp.exp(-V7 / 27.) - alpha_c_val,
+                0.
+            )
+
+        def alpha_q(Ca):
+            """AHP K+ channel activation rate"""
+            return jnp.minimum(0.00002*Ca, 0.01)
+
+        def beta_q(Ca):
+            """AHP K+ channel deactivation rate"""
+            return 0.001
+
+        def chi(Ca):
+            """Ca-dependent activation function"""
+            return jnp.minimum(Ca/250., 1.)
+
+        def m_inf(Vs):
+            """Na+ channel steady-state activation"""
+            return alpha_m(Vs) / (alpha_m(Vs) + beta_m(Vs))
+        
+        def drift_vf(t, y, input_current):
+            ic = input_current(t)
+
+            @jax.vmap
+            def _vf(y, ic):
+                Vs, Vd, n, h, s, c, q, Ca = y
+                I_leak_s = self.g_L_soma * (Vs - self.E_L)
+                I_Na     = self.g_Na    * (m_inf(Vs)**2 * h) * (Vs - self.E_Na)
+                I_DR     = self.g_DR    * n * (Vs - self.E_K)
+                I_ds     = self.g_c     * (Vd - Vs)
+                I_leak_d = self.g_L_dend* (Vd - self.E_L)
+                I_Ca     = self.g_Ca    * (s**2) * (Vd - self.E_Ca)
+                I_AHP    = self.g_AHP   * q * (Vd - self.E_K)
+                I_C      = self.g_C     * c * chi(Ca) * (Vd - self.E_K)
+                I_sd     = -I_ds
+
+                dVsdt = (1.0/self.C_m)*( -I_leak_s - I_Na - I_DR + I_ds/self.p + ic)
+                dVddt = (1.0/self.C_m)*( -I_leak_d - I_Ca - I_AHP - I_C + I_sd/(1.0-self.p))
+                dhdt  = alpha_h(Vs)*(1-h) - beta_h(Vs)*h
+                dndt  = alpha_n(Vs)*(1-n) - beta_n(Vs)*n
+                dsdt  = alpha_s(Vd)*(1-s) - beta_s(Vd)*s
+                dcdt  = alpha_c(Vd)*(1-c) - beta_c(Vd)*c
+                dqdt  = alpha_q(Ca)*(1-q)  - beta_q(Ca)*q
+                dCadt = -self.f_Caconc*I_Ca - self.alpha_Caconc*Ca/self.kCa_Caconc
+
+                out = jnp.array([dVsdt, dVddt, dndt, dhdt, dsdt, dcdt, dqdt, dCadt])
+                out = eqx.error_if(out, jnp.any(jnp.isnan(out)), "out is NaN")
+                out = eqx.error_if(out, jnp.any(jnp.isinf(out)), "out is Inf")
+
+                return out
+            return _vf(y, ic)
+        self.drift_vf = drift_vf
+
     def _initialize_state(self):
         """Initialize state variables for all neurons."""
         # Initial values from the PRmodel
-        v_init = -60.0  # From motoneuron.yaml Numerics section
+        v_init = -60.0  
         
         # Create initial state arrays for all neurons
         Vs0 = jnp.ones(self.num_neurons) * v_init
@@ -123,277 +294,205 @@ class MotoneuronNetwork:
         # Stack into matrix format for diffrax: [8, num_neurons]
         return jnp.stack([Vs0, Vd0, n0, h0, s0, c0, q0, Ca0])
     
-    def alpha_m(self, Vs):
-        """Na+ channel activation rate"""
-        V1 = Vs + 46.9
-        alpha = -0.32 * V1 / (jnp.exp(-V1 / 4.) - 1.)
-        return alpha
+
+    # def vector_field(self, t, y, args):
+    #     # unpack args and build an input_current function
+    #     I_stim, stim_start, stim_end = args
+    #     def input_current_fn(t):
+    #         stim = jnp.where((t>stim_start)&(t<stim_end), I_stim/self.p, jnp.zeros_like(I_stim))
+    #         return stim #+ jnp.dot(self.connections, stim) only apply the external current
+    #     # delegate to vmapped drift_vf
+    #     return self.drift_vf(t, y, input_current_fn)
     
-    def beta_m(self, Vs):
-        """Na+ channel deactivation rate"""
-        V2 = Vs + 19.9
-        beta = 0.28 * V2 / (jnp.exp(V2 / 5.) - 1.)
-        return beta
+    def __call__(self,
+                input_current: Callable[..., Float[ArrayLike, "neurons"]],
+                t_dur: Real,
+                max_spikes: Int,
+                num_samples: Int,
+                *,
+                y0: Optional[Float[Array, "neurons 8"]]=None,
+                num_save: Int=2,
+                dt0: Real=0.01,
+                max_steps: Int = 1000,
+        ):
+        ic_shape = jax.eval_shape(input_current, 0.0)
+        assert ic_shape.shape == (self.num_neurons,)
 
-    def alpha_h(self, Vs):
-        """Na+ channel inactivation rate"""
-        alpha = 0.128 * jnp.exp((-43. - Vs) / 18.)
-        return alpha
+        t0 = 0.0
+        y0 = y0 if y0 is not None else self.initial_state
+        ys = jnp.full((num_samples, max_spikes, self.num_neurons, num_save, 3), jnp.inf)
+        ts = jnp.full((num_samples, max_spikes, num_save), jnp.inf)
+        tevents = jnp.full((num_samples, max_spikes), jnp.inf)
+        num_spikes = 0
+        event_mask = jnp.full((num_samples, self.num_neurons), False)
+        event_types = jnp.full((num_samples, max_spikes, self.num_neurons), False)
 
-    def beta_h(self, Vs):
-        """Na+ channel deinactivation rate"""
-        V5 = Vs + 20.
-        beta = 4. / (1 + jnp.exp(-V5 / 5.))
-        return beta
-
-    def alpha_n(self, Vs):
-        """K+ delayed rectifier activation rate"""
-        V3 = Vs + 24.9
-        alpha = -0.016 * V3 / (jnp.exp(-V3 / 5.) - 1)
-        return alpha
-
-    def beta_n(self, Vs):
-        """K+ delayed rectifier deactivation rate"""
-        V4 = Vs + 40.
-        beta = 0.25 * jnp.exp(-V4 / 40.)
-        return beta
-
-    def alpha_s(self, Vd):
-        """Ca2+ channel activation rate"""
-        alpha = 1.6 / (1 + jnp.exp(-0.072 * (Vd-5.)))
-        return alpha
-
-    def beta_s(self, Vd):
-        """Ca2+ channel deactivation rate"""
-        V6 = Vd + 8.9
-        beta = 0.02 * V6 / (jnp.exp(V6 / 5.) - 1.)
-        return beta
-
-    def alpha_c(self, Vd):
-        """Ca-dependent K+ channel activation rate"""
-        V7 = Vd + 53.5
-        V8 = Vd + 50.
-        return jnp.where(
-            Vd <= -10,
-            0.0527 * jnp.exp(V8/11. - V7/27.),
-            2 * jnp.exp(-V7 / 27.)
+        init_state = NetworkState(
+            ts, ys, tevents, t0, y0, num_spikes, event_mask, event_types
         )
+        stepsize_controller = diffrax.ConstantStepSize()
+        vf = ODETerm(self.drift_vf)
+        root_finder = optimistix.Newton(1e-2, 1e-2, optimistix.rms_norm)
+        event = diffrax.Event(
+            cond_fn=self.cond_fn, 
+            root_finder=root_finder)
+        solver = diffrax.Euler()
+        w_update = self.w.at[self.network].set(0.0)
 
-    def beta_c(self, Vd):
-        """Ca-dependent K+ channel deactivation rate"""
-        V7 = Vd + 53.5
-        alpha_c_val = self.alpha_c(Vd)
-        return jnp.where(
-            Vd <= -10,
-            2. * jnp.exp(-V7 / 27.) - alpha_c_val,
-            0.
-        )
+        @jax.vmap
+        def trans_fn():
+            Vs_out = self.v_reset
+            Vd_out = self.v_reset
+            n_out = 0.001
+            h_out = 0.999
+            s_out = 0.009
+            c_out = 0.007
+            q_out = 0.01
+            Ca_out = 0.2
 
-    def alpha_q(self, Ca):
-        """AHP K+ channel activation rate"""
-        return jnp.minimum(0.00002*Ca, 0.01)
+            return jnp.array([Vs_out, Vd_out, n_out, h_out, s_out, c_out, q_out, Ca_out])
+        
 
-    def beta_q(self, Ca):
-        """AHP K+ channel deactivation rate"""
-        return 0.001
+        def body_fun(state: NetworkState) -> NetworkState:
 
-    def chi(self, Ca):
-        """Ca-dependent activation function"""
-        return jnp.minimum(Ca/250., 1.)
+            @jax.vmap
+            def update(t0, y0):
+                ts = jnp.where(
+                    t0 < t_dur - (t_dur - t0) / (10 * num_save),
+                    jnp.linspace(t0, t_dur, num_save),
+                    jnp.full((num_save,), t0)
+                )
+                ts = eqxi.error_if(ts, ts[1:] < ts[: -1], "ts must be increasing")
+                saveat_ts = diffrax.SubSaveAt(ts=ts)
+                saveat_t1 = diffrax.SubSaveAt(t1=True)
+                saveat = diffrax.SaveAt(subs=(saveat_ts, saveat_t1))
+                terms = vf
 
-    def m_inf(self, Vs):
-        """Na+ channel steady-state activation"""
-        return self.alpha_m(Vs) / (self.alpha_m(Vs) + self.beta_m(Vs))
-    
-    def drift_vf(self, t, state, input_current):
-        # vectorized drift: state is shape (8, N), ic is (N,)
-        ic = input_current(t)
-        # unpack per-variable arrays
-        Vs, Vd, n, h, s, c, q, Ca = state
-        # ionic currents
-        I_leak_s = self.g_L_soma * (Vs - self.E_L)
-        I_Na     = self.g_Na    * (self.m_inf(Vs)**2 * h) * (Vs - self.E_Na)
-        I_DR     = self.g_DR    * n * (Vs - self.E_K)
-        I_ds     = self.g_c     * (Vd - Vs)
-        I_leak_d = self.g_L_dend* (Vd - self.E_L)
-        I_Ca     = self.g_Ca    * (s**2) * (Vd - self.E_Ca)
-        I_AHP    = self.g_AHP   * q * (Vd - self.E_K)
-        I_C      = self.g_C     * c * jnp.minimum(Ca/250.,1.) * (Vd - self.E_K)
-        I_sd     = -I_ds
-        # derivatives per variable
-        dVsdt = (1.0/self.C_m)*( -I_leak_s - I_Na - I_DR + I_ds/self.p + ic)
-        dVddt = (1.0/self.C_m)*( -I_leak_d - I_Ca - I_AHP - I_C + I_sd/(1.0-self.p))
-        dhdt  = self.alpha_h(Vs)*(1-h) - self.beta_h(Vs)*h
-        dndt  = self.alpha_n(Vs)*(1-n) - self.beta_n(Vs)*n
-        dsdt  = self.alpha_s(Vd)*(1-s) - self.beta_s(Vd)*s
-        dcdt  = self.alpha_c(Vd)*(1-c) - self.beta_c(Vd)*c
-        dqdt  = self.alpha_q(Ca)*(1-q)  - self.beta_q(Ca)*q
-        dCadt = -self.f_Caconc*I_Ca - self.alpha_Caconc*Ca/self.kCa_Caconc
-        # stack into (8, N)
-        return jnp.stack([dVsdt, dVddt, dndt, dhdt, dsdt, dcdt, dqdt, dCadt], axis=0)
+                sol = diffeqsolve(
+                    terms,
+                    solver,
+                    t0,
+                    t_dur,
+                    dt0,
+                    y0,
+                    input_current,
+                    throw=False,
+                    stepsize_controller=stepsize_controller,
+                    saveat=saveat,
+                    event=event,
+                    max_steps=max_steps,
+                )
 
-    def vector_field(self, t, y, args):
-        # unpack args and build an input_current function
-        I_stim, stim_start, stim_end = args
-        def input_current_fn(t):
-            stim = jnp.where((t>stim_start)&(t<stim_end), I_stim/self.p, jnp.zeros_like(I_stim))
-            return stim #+ jnp.dot(self.connections, stim) only apply the external current
-        # delegate to vmapped drift_vf
-        return self.drift_vf(t, y, input_current_fn)
-    
-    def solve(self, 
-              t_dur, 
-              I_stim=None, 
-              stim_start=None, 
-              stim_end=None,
-              dt=0.05,
-              max_steps=100000):
-        if I_stim is None:
-            I_stim = jnp.zeros(self.num_neurons)
-        elif not isinstance(I_stim, jnp.ndarray):
-            I_stim = jnp.ones(self.num_neurons) * I_stim
-            
-        if stim_start is None:
-            stim_start = jnp.zeros(self.num_neurons)
-        elif not isinstance(stim_start, jnp.ndarray):
-            stim_start = jnp.ones(self.num_neurons) * stim_start
-            
-        if stim_end is None:
-            stim_end = jnp.zeros(self.num_neurons)
-        elif not isinstance(stim_end, jnp.ndarray):
-            stim_end = jnp.ones(self.num_neurons) * stim_end
-        term = ODETerm(self.vector_field)
-        solver = Dopri5()
-        # Warm-start integration loop: continue until full duration
-        solver_state = None
-        made_jump = None
-        controller_state = None
-        t0_current = 0.0
-        y0_current = self.initial_state
-        sol = None
-      
-        while t0_current < t_dur:
-            prev_t0 = t0_current
-            #save points for this segment: times from t0_current to t_dur
-            n_steps = int((t_dur - t0_current) / dt)
-            ts_loop = jnp.linspace(t0_current, t_dur, n_steps + 1)
-            # include controller_state for warm-start
-            saveat = SaveAt(ts=ts_loop, solver_state=True, controller_state=True, made_jump=True)
-            sol = diffeqsolve(
-                term,
-                solver,
-                t0=t0_current,
-                t1=t_dur,
-                dt0=dt,
-                y0=y0_current,
-                args=(I_stim, stim_start, stim_end),
-                saveat=saveat,
-                event=self.event,
-                max_steps=max_steps,
-                solver_state=solver_state,
-                controller_state=controller_state,
-                made_jump=made_jump,
-                adjoint=RecursiveCheckpointAdjoint(1000),
+                assert sol.event_mask is not None
+                event_mask = jnp.array(sol.event_mask)
+                event_happened = jnp.any(event_mask)
+
+                assert sol.ts is not None
+                ts = sol.ts[0]
+                _t_dur = sol.ts[1]
+                tevent = _t_dur[0]
+                # If tevent > t1 we normalize to keep within range
+                tevent = jnp.where(tevent > t_dur, tevent * (t_dur / tevent), tevent)
+                tevent = eqxi.error_if(tevent, jnp.isnan(tevent), "tevent is nan")
+
+                assert sol.ys is not None
+                ys = sol.ys[0]
+                _y1 = sol.ys[1]
+                yevent = _y1[0].reshape((self.num_neurons, 8))
+                yevent = jnp.where(t0 < t_dur, yevent, y0)
+                yevent = eqxi.error_if(yevent, jnp.any(jnp.isnan(yevent)), "yevent is nan")
+                yevent = eqxi.error_if(yevent, jnp.any(jnp.isinf(yevent)), "yevent is inf")
+
+                event_array = jnp.array(yevent[:, 0] > self.threshold)
+                w_update_t = jnp.where(
+                    jnp.tile(event_array, (self.num_neurons, 1)).T, w_update, 0.0
+                ).T
+                w_update_t = jnp.where(event_happened, w_update_t, 0.0)
+                ytrans = trans_fn(yevent, w_update_t)
+                ys = jnp.transpose(ys, (1, 0, 2))
+
+                return ts, ys, tevent, ytrans, event_array
+            _ts, _ys, tevent, _ytrans, event_mask = update(
+                state.t0, state.y0
             )
-            # If solve did not end on an event (i.e., reached t_dur), break out
-            if sol.result != RESULTS.event_occurred:
-                break
-            #Update the current time and state
-            ts_arr = sol.ts
-            finite_ts = ts_arr[jnp.isfinite(ts_arr)]
-            t_last = float(finite_ts[-1])
-            if t_last <= prev_t0:
-                # no progression
-                break
-            t0_current = t_last
-            ys_arr = sol.ys
-            finite_ys = ys_arr[: finite_ts.shape[0]]
-            y0_current = finite_ys[-1]
-            solver_state = sol.solver_state
-            controller_state = sol.controller_state
-            made_jump = sol.made_jump
-            #Propagate the weights if a spike occurred
-            if sol.result == RESULTS.event_occurred:
-                # # Index of the neuron that spiked
-                # true_indices = jnp.where(jnp.array([bool(em) for em in sol.event_mask]))[0]
-                # print(sol.event_mask)
-                # print("true_indices", true_indices)
-                # true_index = true_indices[0]
-                # #Get the connected neurons index
-                # #array of connected neurons is the row of the connections matrix
-                # connected_neurons = self.connections[true_index]
-                # #the weights are the value of the connections matrix
-                # #now increase the weights of the connected neurons
-                # I_stim = I_stim + connected_neurons
-                # # reset the state of the neuron that spiked using JAX index update
-                # y0_current = y0_current.at[:8, true_index].set(self.initial_state[:8, true_index])
-                # #reset solver_state
-                # solver_state = None
+            num_spikes = state.num_spikes + 1
+            ts = state.ts
+            ts = ts.at[:, state.num_spikes].set(_ts)
 
-                #manually check which neuron crossed the threshold
+            ys = state.ys
+            ys = ys.at[:, state.num_spikes].set(_ys)
 
+            event_types = state.event_types
+            event_types = event_types.at[:, state.num_spikes].set(event_mask)
 
-                #Spike process and get the indices of the neurons that spiked
-                #1e-2 tolerance
-                spike_mask = jnp.abs(y0_current[0] - self.threshold) < 1e-2
-                indices = jnp.where(spike_mask)[0]
-                pre_indices = jnp.where(jnp.isin(self.pre, indices))[0]
-                pre_idx = self.pre[pre_indices]
-                post_idx = self.post[pre_indices]
-                weights = self.w[pre_indices]
+            tevents = state.tevents
+            tevents = tevents.at[:, state.num_spikes].set(tevent)
 
-                ################################
-                # update I_stim for all postsynaptic targets of the spiking pre neurons
-                weights = self.w[pre_indices]
-                dI = segment_sum(weights, post_idx, num_segments=self.num_neurons)
-                # print("dI", dI)
-                I_stim = I_stim + dI
-                # print("I_stim", I_stim)
+            new_state = NetworkState(
+                ts=ts,
+                ys=ys,
+                tevents=tevents,
+                t0=tevent,
+                y0=_ytrans,
+                num_spikes=num_spikes,
+                event_mask=event_mask,
+                event_types=event_types,
+            )
 
-                # print('y0_current', y0_current)
-
-                #reset the state of the neuron that spiked
-                y0_current = y0_current.at[:8, indices].set(self.initial_state[:8, indices])
-                # print('y0_current', y0_current)
-                #reset solver_state
-                solver_state = None
-
-
-                #print event.mask
-                # print("Event mask", sol.event_mask)
-
+            return new_state
+        
+        def stop_fn(state: NetworkState) -> Bool:
+            return (jnp.max(state.num_spikes) <= max_spikes) & (jnp.min(state.t0) < t_dur)
+        
+        final_state = eqxi.while_loop(
+            stop_fn,
+            body_fun,
+            init_state,
+            buffers=buffers,
+            max_steps=max_spikes,
+            kind="checkpointed",
+        )
+        ys = final_state.ys
+        ts = final_state.ts
+        spike_times = final_state.tevents
+        spike_marks = final_state.event_types
+        num_spikes = final_state.num_spikes
+        sol = Solution(
+            t1=t_dur,
+            ys=ys,
+            ts=ts,
+            spike_times=spike_times,
+            spike_marks=spike_marks,
+            num_spikes=num_spikes,
+            max_spikes=max_spikes,
+        )
         return sol
     
-#example usage
-import scipy.sparse as sp
+
+
+
+############################
+# Example usage
+
 if __name__ == "__main__":
-    num_neurons = 3
-    connections = jnp.array([
-     [0.0, 0.5, 0.0],
-     [0.2, 0.0, 0.1],
-     [0.5, 0.5, 0.0],
-   ]) 
-    
-    COO = sp.coo_matrix(connections)
+    # Define the network structure
+    num_neurons = 10
 
-    pre = jnp.array(COO.row)
-    post = jnp.array(COO.col)
-    data = jnp.array(COO.data)
-    model = MotoneuronNetwork(num_neurons, pre=pre, post=post, w=data, threshold=-37.0)
-    
-    # Solve the system
-    t_dur = 100.0
-    I_stim = jnp.array([1, 1, 1])
-    stim_start = jnp.zeros(num_neurons)
-    stim_end = jnp.ones(num_neurons) * 50.0
-    
-    sol = model.solve(t_dur, I_stim, stim_start, stim_end)
-    
-    # print(sol.event_mask)
-    # print(sol.ys[-1])
-    # print("Spike times:", sol.ts)
-    # print("Spike times:", spike_time)
+    # Create the network
+    network_model = MotoneuronNetwork(num_neurons=num_neurons)
 
+    # Define a simple input current function
+    I_stim = jnp.array([0.5] * num_neurons)  # Example input current
+    stim_start = 0.5
+    stim_end = 5
 
+    def input_current(t):
+        stim = jnp.where((t>stim_start)&(t<stim_end), I_stim/0.1, jnp.zeros_like(I_stim))
+        return stim 
 
+    # Run the simulation
+    t_dur = 10
+    max_spikes = 5
+    num_samples = 1
 
+    sol = network_model(input_current, t_dur, max_spikes, num_samples)
