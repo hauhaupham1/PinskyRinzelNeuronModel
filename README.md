@@ -88,32 +88,53 @@ Basic usage of the network:
 from PRmodel_Motoneuron.Network import Network
 import jax.numpy as jnp
 
-# Create a network with 3 neurons
-network = Network(
-    n_neurons=3,
-    yaml_file="motoneuron.yaml"
-)
+if __name__ == "__main__":
+    # Define the network structure
+    num_neurons = 5
+    network = jnp.array([[0, 1, 0, 0, 0],
+                         [0, 0, 0, 0, 0],
+                         [0, 0, 0, 0, 0],
+                         [0, 0, 0, 0, 0],
+                         [0, 0, 0, 0, 0]])
+    weight = jnp.array([[0, 0.5, 0, 0, 0],
+                         [0, 0, 0, 0, 0],
+                         [0, 0, 0, 0, 0],
+                         [0, 0, 0, 0, 0],
+                         [0, 0, 0, 0, 0]])
+            
 
-# Set up connections
-network.set_connection(pre=0, post=1, weight=0.5, reversal=0.0)  # Excitatory: 0 -> 1
-network.set_connection(pre=1, post=2, weight=0.5, reversal=-75.0)  # Inhibitory: 1 -> 2
+    t_dur = 1
+    #I stim is array of shape (num_neurons,) with values of 1
+    I_stim = jnp.ones(num_neurons) * 10.0
+    stim_start = jnp.zeros(num_neurons)
+    stim_end = jnp.ones(num_neurons) * 50.0
+    
+    # Initialize the network
+    network_model = MotoneuronNetwork(
+        num_neurons=num_neurons,
+        network=network,
+        w=weight,
+        v_reset=-60.0,
+        threshold=-37.0,
+        input_current= I_stim,
+        stim_start=stim_start,
+        stim_end=stim_end,
+    )
 
-# Run simulation
-sol = network.solve(
-    t_dur=500.0,
-    I_stim=[0.7, 0.0, 0.5],  # Different current for each neuron
-    stim_start=100.0,
-    stim_end=400.0
-)
+    sol = network_model(
+        t0=0.0, 
+        t1=100.0, 
+        max_spikes=10, 
+        num_samples=1, 
+        key=jr.PRNGKey(0),
+        dt0=0.01
+    )
 
-# Analyze and visualize
-results = network.extract_voltages(sol)
-spike_times = network.get_spike_times(sol)
-fig = network.plot_network(sol)
 ```
 
 ## Credits
 
-The original code is from Marte Julie (https://github.com/CINPLA/PRmodel/blob/master/PRmodel/solve_PRmodel.py)
+The original code is from Marte Julie (https://github.com/CINPLA/PRmodel/blob/master/PRmodel/solve_PRmodel.py) and the code was further extended to include JAX/Diffrax implementations and network capabilities.
+
 paths.py and solution.py are from Cholberg's implementation: (https://github.com/cholberg/snnax)
-The code was further extended to include JAX/Diffrax implementations and network capabilities.
+
