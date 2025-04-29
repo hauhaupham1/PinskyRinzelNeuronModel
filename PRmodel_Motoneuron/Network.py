@@ -290,7 +290,7 @@ class MotoneuronNetwork(eqx.Module):
 
             total_current = external_current + pre_synaptic_I
 
-            jax.debug.print("total_current: {x}", x=total_current) # Use jax.debug.print
+            # jax.debug.print("total_current: {x}", x=total_current) 
             return _vf(y, total_current)
         
         self.vector_field = vector_field_wrapper
