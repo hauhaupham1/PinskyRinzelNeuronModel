@@ -34,6 +34,7 @@ class Solution(eqx.Module):
     spike_marks: Float[Array, "samples spikes neurons"]
     num_spikes: int
     max_spikes: int
+    synaptic_I: Float[Array, "sample neurons"]
 
 
 class NetworkState(eqx.Module):
@@ -42,6 +43,8 @@ class NetworkState(eqx.Module):
     tevents: eqxi.MaybeBuffer[Real[Array, "samples spikes"]]
     t0: Real[Array, " samples"]
     y0: Float[Array, "samples neurons 8"]
+    #Add synaptic_currents so we can directly modify when a neuron spikes
+    synaptic_I: Float[Array, "samples neurons"]
     num_spikes: int
     event_mask: Bool[Array, "samples neurons"]
     event_types: eqxi.MaybeBuffer[Bool[Array, "samples spikes neurons"]]
@@ -69,7 +72,8 @@ class MotoneuronNetwork(eqx.Module):
     read_out_neurons: Sequence[Int]
     threshold: float
     v_reset: float
-    drift_vf: Callable[..., Float[ArrayLike, "neurons 8"]]
+    vector_field: Callable[..., Float[ArrayLike, "neurons 8"]]
+
     # PR model parameters
     C_m: Float
     p: Float
@@ -88,6 +92,9 @@ class MotoneuronNetwork(eqx.Module):
     f_Caconc: Float
     alpha_Caconc: Float
     kCa_Caconc: Float
+    input_current: Float[ArrayLike, "neurons |"]
+    stim_start: Float[ArrayLike, "neurons |"]
+    stim_end: Float[ArrayLike, "neurons |"]
     # Optional diffusion parameters
     sigma: Optional[Float[ArrayLike, "2 2"]]
     diffusion_vf: Optional[Callable[..., Float[ArrayLike, "neurons 8 2 neurons"]]]
@@ -96,6 +103,9 @@ class MotoneuronNetwork(eqx.Module):
     def __init__(
         self,
         num_neurons: Int,
+        input_current: Float = 1.0,
+        stim_start: Float = 0.0,
+        stim_end: Float = 50.0,
         v_reset: Float = -60.0,
         threshold: Float = -20.0,
         w: Optional[Float[Array, "neurons neurons"]] = None,
@@ -144,6 +154,12 @@ class MotoneuronNetwork(eqx.Module):
             read_out_neurons = []
 
         self.read_out_neurons = read_out_neurons
+
+        #ensure that the input_current, stim_start, and stim_end are arrays of length num_neurons
+        self.input_current = jnp.asarray(input_current)
+        self.stim_start = jnp.asarray(stim_start)
+        self.stim_end = jnp.asarray(stim_end)
+
 
         # Set default Pinsky-Rinzel parameters
         self.C_m = 2.0  # Membrane capacitance
@@ -231,45 +247,54 @@ class MotoneuronNetwork(eqx.Module):
             return jnp.minimum(Ca/250., 1.)
 
         # Define the vector field function (drift term)
-        def drift_vf(t, y, input_current):
-            ic = input_current(t)
-
-            @jax.vmap
-            def _vf(y, ic):
-                Vs, Vd, n, h, s, c, q, Ca = y
-                
-                # Somatic currents
-                I_leak_s = self.g_L_soma * (Vs - self.E_L)
-                I_Na = self.g_Na * (m_inf(Vs)**2 * h) * (Vs - self.E_Na)
-                I_DR = self.g_DR * n * (Vs - self.E_K)
-                I_ds = self.g_c * (Vd - Vs)
-                
-                # Dendritic currents
-                I_leak_d = self.g_L_dend * (Vd - self.E_L)
-                I_Ca = self.g_Ca * (s**2) * (Vd - self.E_Ca)
-                I_AHP = self.g_AHP * q * (Vd - self.E_K)
-                I_C = self.g_C * c * chi(Ca) * (Vd - self.E_K)
-                I_sd = -I_ds
-                
-                # Differential equations
-                dVsdt = (1.0/self.C_m) * (-I_leak_s - I_Na - I_DR + I_ds/self.p + ic)
-                dVddt = (1.0/self.C_m) * (-I_leak_d - I_Ca - I_AHP - I_C + I_sd/(1.0-self.p))
-                dhdt = alpha_h(Vs)*(1-h) - beta_h(Vs)*h
-                dndt = alpha_n(Vs)*(1-n) - beta_n(Vs)*n
-                dsdt = alpha_s(Vd)*(1-s) - beta_s(Vd)*s
-                dcdt = alpha_c(Vd)*(1-c) - beta_c(Vd)*c
-                dqdt = alpha_q(Ca)*(1-q) - beta_q(Ca)*q
-                dCadt = -self.f_Caconc*I_Ca - self.alpha_Caconc*Ca/self.kCa_Caconc
-                
-                out = jnp.array([dVsdt, dVddt, dndt, dhdt, dsdt, dcdt, dqdt, dCadt])
-                out = eqx.error_if(out, jnp.any(jnp.isnan(out)), "out is NaN")
-                out = eqx.error_if(out, jnp.any(jnp.isinf(out)), "out is Inf")
-                
-                return out
-                
-            return _vf(y, ic)
+        
+        @jax.vmap
+        def _vf(y, ic):
+            Vs, Vd, n, h, s, c, q, Ca = y
             
-        self.drift_vf = drift_vf
+            # Somatic currents
+            I_leak_s = self.g_L_soma * (Vs - self.E_L)
+            I_Na = self.g_Na * (m_inf(Vs)**2 * h) * (Vs - self.E_Na)
+            I_DR = self.g_DR * n * (Vs - self.E_K)
+            I_ds = self.g_c * (Vd - Vs)
+            
+            # Dendritic currents
+            I_leak_d = self.g_L_dend * (Vd - self.E_L)
+            I_Ca = self.g_Ca * (s**2) * (Vd - self.E_Ca)
+            I_AHP = self.g_AHP * q * (Vd - self.E_K)
+            I_C = self.g_C * c * chi(Ca) * (Vd - self.E_K)
+            I_sd = -I_ds
+            
+            # Differential equations
+            dVsdt = (1.0/self.C_m) * (-I_leak_s - I_Na - I_DR + I_ds/self.p + ic)
+            dVddt = (1.0/self.C_m) * (-I_leak_d - I_Ca - I_AHP - I_C + I_sd/(1.0-self.p))
+            dhdt = alpha_h(Vs)*(1-h) - beta_h(Vs)*h
+            dndt = alpha_n(Vs)*(1-n) - beta_n(Vs)*n
+            dsdt = alpha_s(Vd)*(1-s) - beta_s(Vd)*s
+            dcdt = alpha_c(Vd)*(1-c) - beta_c(Vd)*c
+            dqdt = alpha_q(Ca)*(1-q) - beta_q(Ca)*q
+            dCadt = -self.f_Caconc*I_Ca - self.alpha_Caconc*Ca/self.kCa_Caconc
+            
+            out = jnp.array([dVsdt, dVddt, dndt, dhdt, dsdt, dcdt, dqdt, dCadt])
+            out = eqx.error_if(out, jnp.any(jnp.isnan(out)), "out is NaN")
+            out = eqx.error_if(out, jnp.any(jnp.isinf(out)), "out is Inf")
+            
+            return out
+                
+
+        #Wrapper for the vector field function
+        def vector_field_wrapper(t, y, args):
+            pre_synaptic_I = args["synaptic_I"]
+
+            external_current = jnp.where((t>self.stim_start)&(t<self.stim_end), (self.input_current/self.p), jnp.zeros_like(self.input_current))
+
+            total_current = external_current + pre_synaptic_I
+
+            jax.debug.print("total_current: {x}", x=total_current) # Use jax.debug.print
+            return _vf(y, total_current)
+        
+        self.vector_field = vector_field_wrapper
+        
 
         # Add optional diffusion term
         if diffusion:
@@ -324,7 +349,7 @@ class MotoneuronNetwork(eqx.Module):
     @eqx.filter_jit
     def __call__(
         self,
-        input_current: Callable[..., Float[Array, " neurons"]],
+        # input_current: Callable[..., Float[Array, " neurons"]],
         t0: Real,
         t1: Real,
         max_spikes: Int,
@@ -359,8 +384,8 @@ class MotoneuronNetwork(eqx.Module):
             Solution object containing simulation results.
         """
         # Check input current shape
-        ic_shape = jax.eval_shape(input_current, 0.0)
-        assert ic_shape.shape == (self.num_neurons,)
+        # ic_shape = jax.eval_shape(input_current, 0.0)
+        # assert ic_shape.shape == (self.num_neurons,)
         
         # Convert scalar t0 to array for each sample
         t0, t1 = float(t0), float(t1)
@@ -393,15 +418,27 @@ class MotoneuronNetwork(eqx.Module):
         num_spikes = 0
         event_mask = jnp.full((num_samples, self.num_neurons), False)
         event_types = jnp.full((num_samples, max_spikes, self.num_neurons), False)
+
+        #Initialize synaptic_I
+        init_synaptic_I = jnp.zeros((num_samples, self.num_neurons))
         
         # Create initial state
         init_state = NetworkState(
-            ts, ys, tevents, _t0, y0, num_spikes, event_mask, event_types, key
+            ts=ts,
+            ys= ys, 
+            tevents=tevents,
+            t0= _t0, 
+            y0=y0, 
+            num_spikes=num_spikes, 
+            event_mask=event_mask, 
+            event_types=event_types, 
+            key=key,
+            synaptic_I=init_synaptic_I,
         )
         
         # Setup diffrax solver
         stepsize_controller = diffrax.ConstantStepSize()
-        vf = diffrax.ODETerm(self.drift_vf)
+        vf = diffrax.ODETerm(self.vector_field)
         root_finder = optimistix.Newton(1e-2, 1e-2, optimistix.rms_norm)
         event = diffrax.Event(self.cond_fn, root_finder)
         solver = diffrax.Euler()
@@ -426,9 +463,12 @@ class MotoneuronNetwork(eqx.Module):
         def body_fun(state: NetworkState) -> NetworkState:
             new_key, trans_key = jr.split(state.key, 2)
             trans_key = jr.split(trans_key, num_samples)
+
+            # Update synaptic currents
+            pre_synaptic_I = state.synaptic_I
             
             @jax.vmap
-            def update(_t0, y0, trans_key, bm_key, input_spike):
+            def update(_t0, y0, trans_key, bm_key, input_spike, _pre_synaptic_I):
                 # Define time points to save
                 ts = jnp.where(
                     _t0 < t1 - (t1 - t0) / (10 * num_save),
@@ -444,6 +484,7 @@ class MotoneuronNetwork(eqx.Module):
                 saveat = diffrax.SaveAt(subs=(saveat_ts, saveat_t1))
                 
                 # Set up terms for solver
+                current_args = {"synaptic_I": _pre_synaptic_I}
                 terms = vf
                 multi_terms = []
                 
@@ -474,7 +515,7 @@ class MotoneuronNetwork(eqx.Module):
                     t1,
                     dt0,
                     y0,
-                    input_current,
+                    args=current_args,
                     throw=False,
                     stepsize_controller=stepsize_controller,
                     saveat=saveat,
@@ -512,15 +553,18 @@ class MotoneuronNetwork(eqx.Module):
                 
                 # Apply transition function to reset after spikes
                 ytrans = trans_fn(yevent, event_array, trans_key)
+
+                # Update synaptic currents
+                new_dI = jnp.dot(event_array.astype(self.w.dtype), self.w) / self.p
                 
                 # Reshape outputs
                 ys = jnp.transpose(ys, (1, 0, 2))
                 
-                return ts, ys, tevent, ytrans, event_array
+                return ts, ys, tevent, ytrans, event_array, new_dI
                 
             # Update all samples
-            _ts, _ys, tevent, _ytrans, event_mask = update(
-                state.t0, state.y0, trans_key, bm_key, input_spikes
+            _ts, _ys, tevent, _ytrans, event_mask, new_synaptic_I = update(
+                state.t0, state.y0, trans_key, bm_key, input_spikes, pre_synaptic_I
             )
             
             # Increment spike counter
@@ -537,6 +581,7 @@ class MotoneuronNetwork(eqx.Module):
 
             tevents = state.tevents
             tevents = tevents.at[:, state.num_spikes].set(tevent)
+
             
             # Return new state
             new_state = NetworkState(
@@ -549,7 +594,9 @@ class MotoneuronNetwork(eqx.Module):
                 event_mask=event_mask,
                 event_types=event_types,
                 key=new_key,
+                synaptic_I=new_synaptic_I,
             )
+
             
             return new_state
             
@@ -573,6 +620,9 @@ class MotoneuronNetwork(eqx.Module):
         spike_times = final_state.tevents
         spike_marks = final_state.event_types
         num_spikes = final_state.num_spikes
+
+        #synaptic_I
+        after_spike_I = final_state.synaptic_I
         
         sol = Solution(
             t1=t1,
@@ -582,6 +632,7 @@ class MotoneuronNetwork(eqx.Module):
             spike_marks=spike_marks,
             num_spikes=num_spikes,
             max_spikes=max_spikes,
+            synaptic_I=after_spike_I,
         )
         
         return sol
@@ -590,27 +641,38 @@ class MotoneuronNetwork(eqx.Module):
 
 if __name__ == "__main__":
     # Define the network structure
-    num_neurons = 100
-    
+    num_neurons = 5
+    network = jnp.array([[0, 1, 0, 0, 0],
+                         [0, 0, 0, 0, 0],
+                         [0, 0, 0, 0, 0],
+                         [0, 0, 0, 0, 0],
+                         [0, 0, 0, 0, 0]])
+    weight = jnp.array([[0, 0.5, 0, 0, 0],
+                         [0, 0, 0, 0, 0],
+                         [0, 0, 0, 0, 0],
+                         [0, 0, 0, 0, 0],
+                         [0, 0, 0, 0, 0]])
+            
 
-    t_dur = 100
+    t_dur = 1
     #I stim is array of shape (num_neurons,) with values of 1
-    I_stim = jnp.ones(num_neurons) * 1.0
+    I_stim = jnp.ones(num_neurons) * 10.0
     stim_start = jnp.zeros(num_neurons)
     stim_end = jnp.ones(num_neurons) * 50.0
-    def input_current(t):
-            stim = jnp.where((t>stim_start)&(t<stim_end), (I_stim/0.1), jnp.zeros_like(I_stim))
-            return stim
     
     # Initialize the network
     network_model = MotoneuronNetwork(
         num_neurons=num_neurons,
+        network=network,
+        w=weight,
         v_reset=-60.0,
         threshold=-37.0,
+        input_current= I_stim,
+        stim_start=stim_start,
+        stim_end=stim_end,
     )
 
     sol = network_model(
-        input_current, 
         t0=0.0, 
         t1=100.0, 
         max_spikes=10, 
@@ -619,5 +681,5 @@ if __name__ == "__main__":
         dt0=0.01
     )
 
-    print(sol.spike_marks)
-    print(sol.spike_times)
+    print(sol.synaptic_I)
+
