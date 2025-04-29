@@ -590,18 +590,12 @@ class MotoneuronNetwork(eqx.Module):
 
 if __name__ == "__main__":
     # Define the network structure
-    num_neurons = 3
-    network = jnp.array([[0, 1, 0], 
-                         [1, 0, 1], 
-                         [1, 1, 0]], dtype=bool)
-    
-    weright_matrix = jnp.array([[0.0, 0.5, 0.0],
-                                [0.2, 0.0, 0.1],
-                                [0.5, 0.5, 0.0],])
+    num_neurons = 100
     
 
     t_dur = 100
-    I_stim = jnp.array([0.5, 1, 1])
+    #I stim is array of shape (num_neurons,) with values of 1
+    I_stim = jnp.ones(num_neurons) * 1.0
     stim_start = jnp.zeros(num_neurons)
     stim_end = jnp.ones(num_neurons) * 50.0
     def input_current(t):
@@ -610,11 +604,9 @@ if __name__ == "__main__":
     
     # Initialize the network
     network_model = MotoneuronNetwork(
-        num_neurons=3,
+        num_neurons=num_neurons,
         v_reset=-60.0,
         threshold=-37.0,
-        w=weright_matrix,
-        network=network
     )
 
     sol = network_model(
@@ -628,8 +620,4 @@ if __name__ == "__main__":
     )
 
     print(sol.spike_marks)
-    for k in range(sol.num_spikes):
-        fired_mask   = sol.spike_marks[0, k]       # shape (neurons,)
-        fired_neurons = jnp.where(fired_mask)[0]   # now non‐empty
-        t_k          = sol.spike_times[0, k]
-        print(f"Spike #{k} at t={t_k:.3f} ms by neurons {list(fired_neurons)}")
+    print(sol.spike_times)
