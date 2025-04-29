@@ -34,7 +34,7 @@ class Solution(eqx.Module):
     spike_marks: Float[Array, "samples spikes neurons"]
     num_spikes: int
     max_spikes: int
-    synaptic_I: Float[Array, "sample neurons"]
+    # synaptic_I: Float[Array, "sample neurons"]
 
 
 class NetworkState(eqx.Module):
@@ -622,7 +622,7 @@ class MotoneuronNetwork(eqx.Module):
         num_spikes = final_state.num_spikes
 
         #synaptic_I
-        after_spike_I = final_state.synaptic_I
+        # after_spike_I = final_state.synaptic_I
         
         sol = Solution(
             t1=t1,
@@ -632,7 +632,7 @@ class MotoneuronNetwork(eqx.Module):
             spike_marks=spike_marks,
             num_spikes=num_spikes,
             max_spikes=max_spikes,
-            synaptic_I=after_spike_I,
+            # synaptic_I=after_spike_I,
         )
         
         return sol
@@ -681,5 +681,5 @@ if __name__ == "__main__":
         dt0=0.01
     )
 
-    print(sol.synaptic_I)
+
 
