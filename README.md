@@ -115,5 +115,5 @@ fig = network.plot_network(sol)
 ## Credits
 
 The original code is from Marte Julie (https://github.com/CINPLA/PRmodel/blob/master/PRmodel/solve_PRmodel.py)
-
+paths.py and solution.py are from Cholberg's implementation: (https://github.com/cholberg/snnax)
 The code was further extended to include JAX/Diffrax implementations and network capabilities.
