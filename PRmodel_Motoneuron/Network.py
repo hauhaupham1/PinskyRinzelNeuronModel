@@ -14,6 +14,8 @@ from jax.interpreters import ad
 from jax.typing import ArrayLike
 from jaxtyping import Array, Bool, Float, Int, Real
 
+import matplotlib.pyplot as plt
+
 from paths import BrownianPath, SingleSpikeTrain  
 from solution import Solution
 
@@ -427,7 +429,7 @@ class MotoneuronNetwork(eqx.Module):
         # Setup diffrax solver
         stepsize_controller = diffrax.ConstantStepSize()
         vf = diffrax.ODETerm(self.vector_field)
-        root_finder = optimistix.Newton(1e-2, 1e-2, optimistix.rms_norm)
+        root_finder = optimistix.Newton(1e-6, 1e-6, optimistix.rms_norm)
         event = diffrax.Event(self.cond_fn, root_finder)
         solver = diffrax.Euler()
         w_update = self.w.at[self.network].set(0.0)
@@ -469,7 +471,7 @@ class MotoneuronNetwork(eqx.Module):
                 trans_key = jr.split(trans_key, self.num_neurons)
                 saveat_ts = diffrax.SubSaveAt(ts=ts)
                 saveat_t1 = diffrax.SubSaveAt(t1=True)
-                saveat = diffrax.SaveAt(subs=(saveat_ts, saveat_t1))
+                saveat = diffrax.SaveAt(subs=[saveat_ts, saveat_t1])
                 
                 # Set up terms for solver
                 current_args = {"synaptic_I": _pre_synaptic_I}
@@ -510,6 +512,9 @@ class MotoneuronNetwork(eqx.Module):
                     event=event,
                     max_steps=max_steps,
                 )
+
+                # jax.debug.print("t0={t} tevent={tev} result={res} mask={m}",
+                #                 t=_t0, tev=sol.ts[1][0], res=sol.result, m=sol.event_mask)
                 
                 # Process results
                 assert sol.event_mask is not None
@@ -534,6 +539,7 @@ class MotoneuronNetwork(eqx.Module):
                 
                 # Determine which neurons spiked
                 event_array = jnp.array(yevent[:, 0] > self.threshold - 1e-3)
+                # event_array = jnp.array(sol.event_mask)
                 w_update_t = jnp.where(
                     jnp.tile(event_array, (self.num_neurons, 1)).T, w_update, 0.0
                 ).T
@@ -624,6 +630,107 @@ class MotoneuronNetwork(eqx.Module):
         )
         
         return sol
+    
+    def plot_simulation_results(
+        self,
+        sol: Solution,
+        neurons_to_plot: Optional[Sequence[Int]] = None,
+        plot_spikes: bool = True
+        ):
+        num_samples = sol.ys.shape[0]
+        Vs_index = 0 # Index for Vs 
+
+        if neurons_to_plot is None:
+            neurons_to_plot = range(self.num_neurons)
+        elif not isinstance(neurons_to_plot, Sequence) or not all(isinstance(n, int) for n in neurons_to_plot):
+             raise ValueError("neurons_to_plot must be a sequence of integers or None.")
+
+
+        for sample_idx in range(num_samples):
+            plt.figure(figsize=(12, 6)) 
+
+            print(f"Processing plot for Sample {sample_idx}...")
+
+            valid_spike_count_sample = jnp.sum(jnp.isfinite(sol.spike_times[sample_idx, :]))
+            num_segments_to_process = valid_spike_count_sample + 1 # Segments = spikes + 1 (initial/final)
+            num_segments_to_process = min(num_segments_to_process, sol.max_spikes) 
+
+
+            plotted_lines = []
+            plotted_labels = []
+
+            # Iterate through the neurons requested for plotting
+            for neuron_index in neurons_to_plot:
+                if neuron_index < 0 or neuron_index >= self.num_neurons:
+                    print(f"Warning: Neuron index {neuron_index} out of range (0-{self.num_neurons-1}). Skipping.")
+                    continue
+
+                all_ts_neuron = []
+                all_vs_neuron = []
+
+                # Iterate through the segments for this neuron and sample
+                for spike_idx in range(num_segments_to_process):
+                    ts_seg = sol.ts[sample_idx, spike_idx, :]
+                    vs_seg = sol.ys[sample_idx, spike_idx, neuron_index, :, Vs_index]
+
+                    valid_indices = jnp.isfinite(ts_seg) & jnp.isfinite(vs_seg)
+                    valid_ts = ts_seg[valid_indices]
+                    valid_vs = vs_seg[valid_indices]
+
+                    if valid_ts.size > 0:
+                        all_ts_neuron.append(valid_ts)
+                        all_vs_neuron.append(valid_vs)
+
+                if all_ts_neuron:
+                    full_ts = jnp.concatenate(all_ts_neuron)
+                    full_vs = jnp.concatenate(all_vs_neuron)
+
+    
+                    sort_indices = jnp.argsort(full_ts)
+                    full_ts_sorted = full_ts[sort_indices]
+                    full_vs_sorted = full_vs[sort_indices]
+
+                    # Optional: Remove duplicates
+                    unique_ts, unique_indices = jnp.unique(full_ts_sorted, return_index=True)
+                    unique_vs = full_vs_sorted[unique_indices]
+
+                    # Plot this neuron's trace for the current sample
+                    line, = plt.plot(unique_ts, unique_vs, label=f"Neuron {neuron_index}")
+                    plotted_lines.append(line)
+                    plotted_labels.append(f"Neuron {neuron_index}")
+
+                else:
+                     print(f"No valid data found for Neuron {neuron_index} in Sample {sample_idx}.")
+
+            if plot_spikes:
+                 valid_spike_times = sol.spike_times[sample_idx][jnp.isfinite(sol.spike_times[sample_idx])]
+                 added_spike_legend = False
+                 if len(plotted_lines) > 0:
+                    min_t, max_t = plt.xlim() # Get current plot time range
+                    for spike_t in valid_spike_times:
+                        if spike_t >= min_t and spike_t <= max_t :
+                            label = 'Spike' if not added_spike_legend else ""
+                            plt.axvline(spike_t, color='r', linestyle='--', alpha=0.6, label=label)
+                            added_spike_legend = True
+
+
+            # Finalize plot for the current sample
+            plt.xlabel("Time (ms)")
+            plt.ylabel("Voltage (mV)")
+            plt.title(f"Sample {sample_idx}: Neuron Voltage Traces")
+            if plotted_lines:
+                custom_legend_handles = plotted_lines
+                custom_legend_labels = plotted_labels
+                if plot_spikes and added_spike_legend:
+                     from matplotlib.lines import Line2D
+                     spike_legend_entry = Line2D([0], [0], color='r', linestyle='--', alpha=0.6, label='Spike')
+                     custom_legend_handles.append(spike_legend_entry)
+                     custom_legend_labels.append('Spike')
+
+                plt.legend(handles=custom_legend_handles, labels=custom_legend_labels)
+
+            plt.grid(True)
+            plt.show() # Show the plot for the current sample
 ############################
 # Example usage
 
@@ -641,12 +748,16 @@ if __name__ == "__main__":
                          [0, 0, 0, 0, 0],
                          [0, 0, 0, 0, 0]])
             
-
-    t_dur = 1
     #I stim is array of shape (num_neurons,) with values of 1
-    I_stim = jnp.ones(num_neurons) * 10.0
+    I_stim = jnp.zeros(num_neurons)
+    #only stimulate neuron 0
+    I_stim = I_stim.at[0].set(1)
+    I_stim = I_stim.at[1].set(1.5)
+    I_stim = I_stim.at[2].set(2)
+    I_stim = I_stim.at[3].set(2.5)
+    I_stim = I_stim.at[4].set(3.5)
     stim_start = jnp.zeros(num_neurons)
-    stim_end = jnp.ones(num_neurons) * 50.0
+    stim_end = jnp.ones(num_neurons) * 10
     
     # Initialize the network
     network_model = MotoneuronNetwork(
@@ -662,12 +773,22 @@ if __name__ == "__main__":
 
     sol = network_model(
         t0=0.0, 
-        t1=100.0, 
-        max_spikes=10, 
+        t1=20, 
+        max_spikes=20, 
         num_samples=1, 
         key=jr.PRNGKey(0),
-        dt0=0.01
+        dt0=0.01,
+        num_save=50,
+        max_steps=1500,
     )
 
+    # Plot the simulation results
+    print(sol.spike_times)
+    print(sol.num_spikes)
+    network_model.plot_simulation_results(sol, neurons_to_plot=[0, 1, 2, 3, 4], plot_spikes=True)
 
-
+    print("Spike Marks (Sample 0):")
+# Check which neuron(s) caused the event ending at t=8.506
+    print(f"Event 0 (t={sol.spike_times[0, 0]:.4f}): {sol.spike_marks[0, 0, :]}")
+    # Check which neuron(s) caused the event ending at t=18.507
+    print(f"Event 1 (t={sol.spike_times[0, 1]:.4f}): {sol.spike_marks[0, 1, :]}")
