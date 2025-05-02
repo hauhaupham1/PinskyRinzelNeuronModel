@@ -280,7 +280,7 @@ class MotoneuronNetwork(eqx.Module):
 
             total_current = external_current + pre_synaptic_I
 
-            jax.debug.print("total_current: {x}", x=total_current) 
+            # jax.debug.print("total_current: {x}", x=total_current) 
             return _vf(y, total_current)
         
         self.vector_field = vector_field_wrapper
@@ -552,7 +552,8 @@ class MotoneuronNetwork(eqx.Module):
 
                 # Update synaptic currents
                 # new_dI = jnp.dot(event_array.astype(self.w.dtype), self.w) / self.p
-                new_dI = jnp.sum(w_update_t, axis=0) / self.p
+                new_dI = jnp.sum(w_update_t, axis=-1) / self.p
+                jax.debug.print("new_dI: {x}", x=new_dI)
                 
                 # Reshape outputs
                 ys = jnp.transpose(ys, (1, 0, 2))
@@ -758,11 +759,11 @@ if __name__ == "__main__":
     #I stim is array of shape (num_neurons,) with values of 1
     I_stim = jnp.zeros(num_neurons)
     #only stimulate neuron 0
-    I_stim = I_stim.at[0].set(1)
+    I_stim = I_stim.at[0].set(3.5)
     I_stim = I_stim.at[1].set(1.5)
     I_stim = I_stim.at[2].set(2)
     I_stim = I_stim.at[3].set(2.5)
-    I_stim = I_stim.at[4].set(3.5)
+    I_stim = I_stim.at[4].set(1)
     stim_start = jnp.zeros(num_neurons)
     stim_end = jnp.ones(num_neurons) * 10
     
@@ -790,7 +791,7 @@ if __name__ == "__main__":
     )
 
     # Plot the simulation results
-    print(sol.spike_times)
+    print(sol.get_spikes())
     # print(sol.num_spikes)
-    # network_model.plot_simulation_results(sol, neurons_to_plot=[0, 1, 2, 3, 4], plot_spikes=True)
+    network_model.plot_simulation_results(sol, neurons_to_plot=[0, 1, 2, 3, 4], plot_spikes=True)
     # print(network_model.input_current)
