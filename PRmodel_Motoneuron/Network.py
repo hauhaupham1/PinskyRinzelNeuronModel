@@ -135,7 +135,7 @@ class MotoneuronNetwork(eqx.Module):
         w_key, sigma_key = jr.split(key, 2)
 
         if network is None:
-            network = np.full((num_neurons, num_neurons), False)
+            network = np.full((num_neurons, num_neurons), 0)
 
         self.w = _build_w(w, network, w_key, wmin, wmax)
         self.network = network
@@ -280,7 +280,7 @@ class MotoneuronNetwork(eqx.Module):
 
             total_current = external_current + pre_synaptic_I
 
-            # jax.debug.print("total_current: {x}", x=total_current) 
+            jax.debug.print("total_current: {x}", x=total_current) 
             return _vf(y, total_current)
         
         self.vector_field = vector_field_wrapper
@@ -432,7 +432,9 @@ class MotoneuronNetwork(eqx.Module):
         root_finder = optimistix.Newton(1e-6, 1e-6, optimistix.rms_norm)
         event = diffrax.Event(self.cond_fn, root_finder)
         solver = diffrax.Euler()
-        w_update = self.w.at[self.network].set(0.0)
+        # w_update = self.w.at[self.network].set(0.0)
+        #using jnp.where
+        w_update = jnp.where(self.network, self.w, 0.0)
         
         # Define transition function to reset state after spikes
         @jax.vmap
@@ -549,7 +551,8 @@ class MotoneuronNetwork(eqx.Module):
                 ytrans = trans_fn(yevent, event_array, trans_key)
 
                 # Update synaptic currents
-                new_dI = jnp.dot(event_array.astype(self.w.dtype), self.w) / self.p
+                # new_dI = jnp.dot(event_array.astype(self.w.dtype), self.w) / self.p
+                new_dI = jnp.sum(w_update_t, axis=0) / self.p
                 
                 # Reshape outputs
                 ys = jnp.transpose(ys, (1, 0, 2))
@@ -560,6 +563,10 @@ class MotoneuronNetwork(eqx.Module):
             _ts, _ys, tevent, _ytrans, event_mask, new_synaptic_I = update(
                 state.t0, state.y0, trans_key, bm_key, input_spikes, pre_synaptic_I
             )
+            # jax.debug.print("pre_synaptic_I: {x}", x=pre_synaptic_I)
+            # jax.debug.print("new_synaptic_I: {x}", x=new_synaptic_I)
+
+        
             
             # Increment spike counter
             num_spikes = state.num_spikes + 1
@@ -737,16 +744,16 @@ class MotoneuronNetwork(eqx.Module):
 if __name__ == "__main__":
     # Define the network structure
     num_neurons = 5
-    network = jnp.array([[0, 1, 0, 0, 0],
-                         [0, 0, 0, 0, 0],
-                         [0, 0, 0, 0, 0],
-                         [0, 0, 0, 0, 0],
-                         [0, 0, 0, 0, 0]])
-    weight = jnp.array([[0, 0.5, 0, 0, 0],
-                         [0, 0, 0, 0, 0],
-                         [0, 0, 0, 0, 0],
-                         [0, 0, 0, 0, 0],
-                         [0, 0, 0, 0, 0]])
+    network = jnp.array([[0, 1, 1, 1, 1],
+                         [1, 0, 1, 1, 1],
+                         [1, 1, 0, 1, 1],
+                         [1, 1, 1, 0, 1],
+                         [1, 1, 1, 1, 0]])
+    weight = jnp.array([[0, 0.5, 0.5, 0.5, 0.5],
+                         [0, 0, 0.5, 0.5, 0.5],
+                         [0, 0, 0, 0.5, 0.5],
+                         [0, 0, 0, 0, 0.5],
+                         [0, 0, 0.5, 0.5, 0]])
             
     #I stim is array of shape (num_neurons,) with values of 1
     I_stim = jnp.zeros(num_neurons)
@@ -784,11 +791,6 @@ if __name__ == "__main__":
 
     # Plot the simulation results
     print(sol.spike_times)
-    print(sol.num_spikes)
-    network_model.plot_simulation_results(sol, neurons_to_plot=[0, 1, 2, 3, 4], plot_spikes=True)
-
-    print("Spike Marks (Sample 0):")
-# Check which neuron(s) caused the event ending at t=8.506
-    print(f"Event 0 (t={sol.spike_times[0, 0]:.4f}): {sol.spike_marks[0, 0, :]}")
-    # Check which neuron(s) caused the event ending at t=18.507
-    print(f"Event 1 (t={sol.spike_times[0, 1]:.4f}): {sol.spike_marks[0, 1, :]}")
+    # print(sol.num_spikes)
+    # network_model.plot_simulation_results(sol, neurons_to_plot=[0, 1, 2, 3, 4], plot_spikes=True)
+    # print(network_model.input_current)
