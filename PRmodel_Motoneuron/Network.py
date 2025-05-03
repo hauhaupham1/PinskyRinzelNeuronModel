@@ -643,16 +643,17 @@ class MotoneuronNetwork(eqx.Module):
         self,
         sol: Solution,
         neurons_to_plot: Optional[Sequence[Int]] = None,
-        plot_spikes: bool = True
+        plot_spikes: bool = True,
+        plot_dendrite: bool = True  # New parameter to control Vd plotting
         ):
         num_samples = sol.ys.shape[0]
-        Vs_index = 0 # Index for Vs 
+        Vs_index = 0  # Index for somatic voltage (Vs)
+        Vd_index = 1  # Index for dendritic voltage (Vd)
 
         if neurons_to_plot is None:
             neurons_to_plot = range(self.num_neurons)
         elif not isinstance(neurons_to_plot, Sequence) or not all(isinstance(n, int) for n in neurons_to_plot):
              raise ValueError("neurons_to_plot must be a sequence of integers or None.")
-
 
         for sample_idx in range(num_samples):
             plt.figure(figsize=(12, 6)) 
@@ -660,9 +661,8 @@ class MotoneuronNetwork(eqx.Module):
             print(f"Processing plot for Sample {sample_idx}...")
 
             valid_spike_count_sample = jnp.sum(jnp.isfinite(sol.spike_times[sample_idx, :]))
-            num_segments_to_process = valid_spike_count_sample + 1 # Segments = spikes + 1 (initial/final)
+            num_segments_to_process = valid_spike_count_sample + 1  # Segments = spikes + 1 (initial/final)
             num_segments_to_process = min(num_segments_to_process, sol.max_spikes) 
-
 
             plotted_lines = []
             plotted_labels = []
@@ -673,43 +673,69 @@ class MotoneuronNetwork(eqx.Module):
                     print(f"Warning: Neuron index {neuron_index} out of range (0-{self.num_neurons-1}). Skipping.")
                     continue
 
+                # Process somatic voltage (Vs)
                 all_ts_neuron = []
                 all_vs_neuron = []
+                
+                # Process dendritic voltage (Vd) if requested
+                all_vd_neuron = [] if plot_dendrite else None
 
                 # Iterate through the segments for this neuron and sample
                 for spike_idx in range(num_segments_to_process):
                     ts_seg = sol.ts[sample_idx, spike_idx, :]
                     vs_seg = sol.ys[sample_idx, spike_idx, neuron_index, :, Vs_index]
-
-                    valid_indices = jnp.isfinite(ts_seg) & jnp.isfinite(vs_seg)
+                    
+                    if plot_dendrite:
+                        vd_seg = sol.ys[sample_idx, spike_idx, neuron_index, :, Vd_index]
+                        valid_indices = jnp.isfinite(ts_seg) & jnp.isfinite(vs_seg) & jnp.isfinite(vd_seg)
+                    else:
+                        valid_indices = jnp.isfinite(ts_seg) & jnp.isfinite(vs_seg)
+                    
                     valid_ts = ts_seg[valid_indices]
                     valid_vs = vs_seg[valid_indices]
+                    
+                    if plot_dendrite:
+                        valid_vd = vd_seg[valid_indices]
 
                     if valid_ts.size > 0:
                         all_ts_neuron.append(valid_ts)
                         all_vs_neuron.append(valid_vs)
+                        if plot_dendrite:
+                            all_vd_neuron.append(valid_vd)
 
                 if all_ts_neuron:
+                    # Process soma voltage
                     full_ts = jnp.concatenate(all_ts_neuron)
                     full_vs = jnp.concatenate(all_vs_neuron)
-
-    
+                    
                     sort_indices = jnp.argsort(full_ts)
                     full_ts_sorted = full_ts[sort_indices]
                     full_vs_sorted = full_vs[sort_indices]
 
-                    # Optional: Remove duplicates
+                    # Remove duplicates
                     unique_ts, unique_indices = jnp.unique(full_ts_sorted, return_index=True)
                     unique_vs = full_vs_sorted[unique_indices]
 
-                    # Plot this neuron's trace for the current sample
-                    line, = plt.plot(unique_ts, unique_vs, label=f"Neuron {neuron_index}")
-                    plotted_lines.append(line)
-                    plotted_labels.append(f"Neuron {neuron_index}")
-
+                    # Plot soma voltage
+                    line_soma, = plt.plot(unique_ts, unique_vs, label=f"Neuron {neuron_index} (Soma)", 
+                                         color=f"C{neuron_index}")
+                    plotted_lines.append(line_soma)
+                    plotted_labels.append(f"Neuron {neuron_index} (Soma)")
+                    
+                    # Plot dendrite voltage if requested
+                    if plot_dendrite and all_vd_neuron:
+                        full_vd = jnp.concatenate(all_vd_neuron)
+                        full_vd_sorted = full_vd[sort_indices]
+                        unique_vd = full_vd_sorted[unique_indices]
+                        
+                        line_dend, = plt.plot(unique_ts, unique_vd, label=f"Neuron {neuron_index} (Dendrite)",
+                                             linestyle='--', color=f"C{neuron_index}")
+                        plotted_lines.append(line_dend)
+                        plotted_labels.append(f"Neuron {neuron_index} (Dendrite)")
                 else:
                      print(f"No valid data found for Neuron {neuron_index} in Sample {sample_idx}.")
 
+            # Plot spike markers
             if plot_spikes:
                  valid_spike_times = sol.spike_times[sample_idx][jnp.isfinite(sol.spike_times[sample_idx])]
                  added_spike_legend = False
@@ -721,11 +747,11 @@ class MotoneuronNetwork(eqx.Module):
                             plt.axvline(spike_t, color='r', linestyle='--', alpha=0.6, label=label)
                             added_spike_legend = True
 
-
             # Finalize plot for the current sample
             plt.xlabel("Time (ms)")
             plt.ylabel("Voltage (mV)")
             plt.title(f"Sample {sample_idx}: Neuron Voltage Traces")
+            
             if plotted_lines:
                 custom_legend_handles = plotted_lines
                 custom_legend_labels = plotted_labels
@@ -793,5 +819,5 @@ if __name__ == "__main__":
     # Plot the simulation results
     print(sol.get_spikes())
     # print(sol.num_spikes)
-    network_model.plot_simulation_results(sol, neurons_to_plot=[0, 1, 2, 3, 4], plot_spikes=True)
+    network_model.plot_simulation_results(sol, neurons_to_plot=[0, 1, 2, 3, 4], plot_spikes=True, plot_dendrite=False)
     # print(network_model.input_current)
