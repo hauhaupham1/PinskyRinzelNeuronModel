@@ -16,8 +16,8 @@ from jaxtyping import Array, Bool, Float, Int, Real
 
 import matplotlib.pyplot as plt
 
-from paths import BrownianPath, SingleSpikeTrain  
-from solution import Solution
+from .paths import BrownianPath, SingleSpikeTrain  
+from .solution import Solution
 
 
 # Work around JAX issue #22011, similar to what's in snn.py
@@ -63,6 +63,7 @@ class MotoneuronNetwork(eqx.Module):
     threshold: float
     v_reset: float
     vector_field: Callable[..., Float[ArrayLike, "neurons 8"]]
+    _vf_implementation: Callable[..., Float[ArrayLike, "neurons 8"]]
 
     # PR model parameters
     C_m: Float
@@ -82,9 +83,9 @@ class MotoneuronNetwork(eqx.Module):
     f_Caconc: Float
     alpha_Caconc: Float
     kCa_Caconc: Float
-    input_current: Float[ArrayLike, "neurons |"]
-    stim_start: Float[ArrayLike, "neurons |"]
-    stim_end: Float[ArrayLike, "neurons |"]
+    # input_current: Float[ArrayLike, "neurons |"]
+    # stim_start: Float[ArrayLike, "neurons |"]
+    # stim_end: Float[ArrayLike, "neurons |"]
     # Optional diffusion parameters
     sigma: Optional[Float[ArrayLike, "2 2"]]
     diffusion_vf: Optional[Callable[..., Float[ArrayLike, "neurons 8 2 neurons"]]]
@@ -93,9 +94,9 @@ class MotoneuronNetwork(eqx.Module):
     def __init__(
         self,
         num_neurons: Int,
-        input_current: Float = 1.0,
-        stim_start: Float = 0.0,
-        stim_end: Float = 50.0,
+        # input_current: Float = 1.0,
+        # stim_start: Float = 0.0,
+        # stim_end: Float = 50.0,
         v_reset: Float = -60.0,
         threshold: Float = -20.0,
         w: Optional[Float[Array, "neurons neurons"]] = None,
@@ -146,9 +147,9 @@ class MotoneuronNetwork(eqx.Module):
         self.read_out_neurons = read_out_neurons
 
         #ensure that the input_current, stim_start, and stim_end are arrays of length num_neurons
-        self.input_current = jnp.asarray(input_current)
-        self.stim_start = jnp.asarray(stim_start)
-        self.stim_end = jnp.asarray(stim_end)
+        # self.input_current = jnp.asarray(input_current)
+        # self.stim_start = jnp.asarray(stim_start)
+        # self.stim_end = jnp.asarray(stim_end)
 
 
         # Set default Pinsky-Rinzel parameters
@@ -270,18 +271,23 @@ class MotoneuronNetwork(eqx.Module):
             out = eqx.error_if(out, jnp.any(jnp.isinf(out)), "out is Inf")
             
             return out
+        self._vf_implementation = _vf
                 
 
         #Wrapper for the vector field function
-        def vector_field_wrapper(t, y, args):
-            pre_synaptic_I = args["synaptic_I"]
+        def vector_field_wrapper(t, y, ode_args_dict): 
+            # Unpack from the ode_args_dict
+            input_current_func = ode_args_dict['input_current'] # This is the callable      
+            synaptic_I_arr = ode_args_dict['synaptic_I']       
 
-            external_current = jnp.where((t>self.stim_start)&(t<self.stim_end), (self.input_current/self.p), jnp.zeros_like(self.input_current))
+            # Get current magnitudes by calling the function
+            current_magnitudes_at_t = input_current_func(t)
 
-            total_current = external_current + pre_synaptic_I
-
-            # jax.debug.print("total_current: {x}", x=total_current) 
-            return _vf(y, total_current)
+            external_current_to_apply = current_magnitudes_at_t / self.p 
+            total_current = external_current_to_apply + synaptic_I_arr
+            
+            # Call the stored core dynamics implementation
+            return self._vf_implementation(y, total_current) 
         
         self.vector_field = vector_field_wrapper
         
@@ -339,7 +345,7 @@ class MotoneuronNetwork(eqx.Module):
     @eqx.filter_jit
     def __call__(
         self,
-        # input_current: Callable[..., Float[Array, " neurons"]],
+        input_current: Callable[..., Float[Array, " neurons"]],
         t0: Real,
         t1: Real,
         max_spikes: Int,
@@ -476,7 +482,10 @@ class MotoneuronNetwork(eqx.Module):
                 saveat = diffrax.SaveAt(subs=[saveat_ts, saveat_t1])
                 
                 # Set up terms for solver
-                current_args = {"synaptic_I": _pre_synaptic_I}
+                current_ode_args = {
+                      "synaptic_I": _pre_synaptic_I, # As before
+                      "input_current": input_current, # Passed into __call__
+                  }
                 terms = vf
                 multi_terms = []
                 
@@ -507,7 +516,7 @@ class MotoneuronNetwork(eqx.Module):
                     t1,
                     dt0,
                     y0,
-                    args=current_args,
+                    args=current_ode_args,
                     throw=False,
                     stepsize_controller=stepsize_controller,
                     saveat=saveat,
@@ -553,7 +562,7 @@ class MotoneuronNetwork(eqx.Module):
                 # Update synaptic currents
                 # new_dI = jnp.dot(event_array.astype(self.w.dtype), self.w) / self.p
                 new_dI = jnp.sum(w_update_t, axis=-1) / self.p
-                jax.debug.print("new_dI: {x}", x=new_dI)
+                # jax.debug.print("new_dI: {x}", x=new_dI)
                 
                 # Reshape outputs
                 ys = jnp.transpose(ys, (1, 0, 2))
