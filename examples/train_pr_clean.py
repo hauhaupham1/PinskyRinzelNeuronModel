@@ -8,7 +8,7 @@ import optax
 
 # Add the project root to the path so we can import the My_Network module
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from My_Network.Network import MotoneuronNetwork
+from PRmodel_Motoneuron.Network import MotoneuronNetwork
 
 # Create a simple network with 4 neurons
 num_neurons = 4
