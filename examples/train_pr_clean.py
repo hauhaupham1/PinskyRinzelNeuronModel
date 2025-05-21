@@ -8,7 +8,7 @@ import optax
 
 # Add the project root to the path so we can import the My_Network module
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from PRmodel_Motoneuron.Network import MotoneuronNetwork
+from livn.models.pr.Network import MotoneuronNetwork
 
 # Create a simple network with 4 neurons
 num_neurons = 4
@@ -54,7 +54,7 @@ def compute_loss(inputs, model, t_end, key):
     # Create input current wrapper
     input_current_fn = InputCurrentWrapper(inputs)
     
-    # Run simulation
+    # Run simulation with memory optimization
     solution = model(
         input_current=input_current_fn,
         t0=0.0,
@@ -64,11 +64,13 @@ def compute_loss(inputs, model, t_end, key):
         key=key,
         dt0=0.01,
         num_save=20,
-        max_steps=1500
+        max_steps=1500,
+        store_vars=('Vs',),  # Only store somatic voltage for efficiency
+        memory_efficient=True,
     )
     
-    # Get all somatic voltages (first component of state vector)
-    somatic_voltages = solution.ys[0, :, :, :, 0]
+    # Get all somatic voltages (same as original but accounting for memory efficiency)
+    somatic_voltages = solution.ys[0, :, :, :, 0]  # Still works with memory_efficient=True when storing only Vs
     
     # Create a mask for finite values
     finite_mask = jnp.isfinite(somatic_voltages)
@@ -140,4 +142,3 @@ for iteration in range(num_iterations):
     end_time = time.time()
     
     print(f"Step: {iteration}, Loss: {loss:.4f}, Computation time: {end_time - start_time:.4f}s")
-

@@ -1,7 +1,19 @@
+"""
+Pinsky-Rinzel Motoneuron Network Implementation
+
+Credits:
+    - Solution class and paths implementation by Christian Holberg
+    - Network implementation inspired by snnax package from Christian Holberg
+"""
+
 import functools as ft
 from typing import Any, Callable, List, Optional, Sequence
 
 import diffrax
+from diffrax import AbstractPath, BrownianIncrement, SpaceTimeLevyArea, VirtualBrownianTree
+from diffrax._brownian.tree import _levy_diff, _make_levy_val
+from diffrax._custom_types import RealScalarLike, levy_tree_transpose
+from diffrax._misc import linear_rescale
 import equinox as eqx
 import equinox.internal as eqxi
 import jax
@@ -12,12 +24,401 @@ import optimistix
 from jax._src.ad_util import stop_gradient_p
 from jax.interpreters import ad
 from jax.typing import ArrayLike
-from jaxtyping import Array, Bool, Float, Int, Real
+from jaxtyping import Array, Bool, Float, Int, Real, PRNGKeyArray, PyTree
 
 import matplotlib.pyplot as plt
+from typing import Literal, Optional, Tuple, Union
+import jax.tree_util as jtu
+from typing_extensions import TypeAlias
+_Spline: TypeAlias = Literal["sqrt", "quad", "zero"]
 
-from .paths import BrownianPath, SingleSpikeTrain  
-from .solution import Solution
+
+class Solution(eqx.Module):
+    """Solution of the event-driven model."""
+
+    t1: Real
+    ys: Float[Array, "samples spikes neurons times state_vars"]  # state_vars can be 1 (Vs) or more
+    ts: Float[Array, "samples spikes times"]
+    spike_times: Float[Array, "samples spikes"]
+    spike_marks: Float[Array, "samples spikes neurons"]
+    num_spikes: int
+    max_spikes: int
+    stored_vars: tuple = eqx.field(static=True, default=('Vs',))
+    # synaptic_I: Float[Array, "sample neurons"]
+
+    def get_spikes(self, sample_idx=0):
+        """
+        Get the spike times for a specific sample.
+        
+        Args:
+            sample_idx: Index of the sample to get spikes for
+            
+        Returns:
+            Array of spike times for the sample
+        """
+        # Get the spike times for the sample
+        spike_times = self.spike_times[sample_idx]
+        
+        # Filter out invalid (inf) spike times
+        valid_spikes = jnp.isfinite(spike_times)
+        return spike_times[valid_spikes]
+        
+    def get_voltages(self, sample_idx=0, neuron_idx=0):
+        """
+        Get the voltage traces for a specific sample and neuron.
+        
+        Args:
+            sample_idx: Index of the sample to get voltages for
+            neuron_idx: Index of the neuron to get voltages for
+            
+        Returns:
+            Dictionary with 'times' and 'Vs' (somatic voltage) keys
+        """
+        # Extract time points and voltages
+        all_times = []
+        all_voltages = []
+        
+        # Number of segments (spike-to-spike) to process
+        valid_spike_count = jnp.sum(jnp.isfinite(self.spike_times[sample_idx]))
+        num_segments = min(valid_spike_count + 1, self.max_spikes)
+        
+        # Determine voltage index - for memory efficiency we might only store Vs
+        voltage_idx = 0  # Default index for Vs (somatic voltage)
+        
+        # Iterate through each segment
+        for spike_idx in range(num_segments):
+            times = self.ts[sample_idx, spike_idx]
+            
+            # Handle case where we may only store somatic voltage
+            if len(self.stored_vars) == 1 and self.stored_vars[0] == 'Vs':
+                # If we're only storing Vs, we don't need to index the state dimension
+                if self.ys.shape[-1] == 1:
+                    voltages = self.ys[sample_idx, spike_idx, neuron_idx, :]
+                else:
+                    voltages = self.ys[sample_idx, spike_idx, neuron_idx, :, voltage_idx]
+            else:
+                # Otherwise find the correct index for Vs
+                if 'Vs' in self.stored_vars:
+                    voltage_idx = self.stored_vars.index('Vs')
+                    
+                voltages = self.ys[sample_idx, spike_idx, neuron_idx, :, voltage_idx]
+            
+            # Filter out invalid (inf) values
+            valid_idx = jnp.isfinite(times) & jnp.isfinite(voltages)
+            valid_times = times[valid_idx]
+            valid_voltages = voltages[valid_idx]
+            
+            if len(valid_times) > 0:
+                all_times.append(valid_times)
+                all_voltages.append(valid_voltages)
+        
+        # Combine all segments
+        if all_times:
+            times_combined = jnp.concatenate(all_times)
+            voltages_combined = jnp.concatenate(all_voltages)
+            
+            # Sort by time
+            sort_idx = jnp.argsort(times_combined)
+            times_sorted = times_combined[sort_idx]
+            voltages_sorted = voltages_combined[sort_idx]
+            
+            return {
+                'times': times_sorted,
+                'Vs': voltages_sorted
+            }
+        
+        return {
+            'times': jnp.array([]),
+            'Vs': jnp.array([])
+        }
+        
+    def get_dendrite_voltages(self, sample_idx=0, neuron_idx=0):
+        """
+        Get the dendritic voltage traces for a specific sample and neuron.
+        
+        Args:
+            sample_idx: Index of the sample to get voltages for
+            neuron_idx: Index of the neuron to get voltages for
+            
+        Returns:
+            Dictionary with 'times' and 'Vd' (dendritic voltage) keys
+        """
+        # Check if dendritic voltage is stored
+        if 'Vd' not in self.stored_vars:
+            return {
+                'times': jnp.array([]),
+                'Vd': jnp.array([])
+            }
+        
+        # Find index of Vd in stored variables
+        vd_index = self.stored_vars.index('Vd')
+        
+        # Extract time points and voltages
+        all_times = []
+        all_voltages = []
+        
+        # Number of segments (spike-to-spike) to process
+        valid_spike_count = jnp.sum(jnp.isfinite(self.spike_times[sample_idx]))
+        num_segments = min(valid_spike_count + 1, self.max_spikes)
+        
+        # Iterate through each segment
+        for spike_idx in range(num_segments):
+            times = self.ts[sample_idx, spike_idx]
+            
+            # Extract dendritic voltage at the right index
+            if len(self.stored_vars) == 1 and self.stored_vars[0] == 'Vd':
+                # Special case: if only storing Vd
+                if self.ys.shape[-1] == 1:
+                    voltages = self.ys[sample_idx, spike_idx, neuron_idx, :]
+                else:
+                    voltages = self.ys[sample_idx, spike_idx, neuron_idx, :, 0]  # Index 0 if only Vd
+            else:
+                voltages = self.ys[sample_idx, spike_idx, neuron_idx, :, vd_index]
+            
+            # Filter out invalid (inf) values
+            valid_idx = jnp.isfinite(times) & jnp.isfinite(voltages)
+            valid_times = times[valid_idx]
+            valid_voltages = voltages[valid_idx]
+            
+            if len(valid_times) > 0:
+                all_times.append(valid_times)
+                all_voltages.append(valid_voltages)
+        
+        # Combine all segments
+        if all_times:
+            times_combined = jnp.concatenate(all_times)
+            voltages_combined = jnp.concatenate(all_voltages)
+            
+            # Sort by time
+            sort_idx = jnp.argsort(times_combined)
+            times_sorted = times_combined[sort_idx]
+            voltages_sorted = voltages_combined[sort_idx]
+            
+            return {
+                'times': times_sorted,
+                'Vd': voltages_sorted
+            }
+        
+        return {
+            'times': jnp.array([]),
+            'Vd': jnp.array([])
+        }
+
+
+def plottable_paths(
+    sol: Solution,
+) -> Tuple[Real[Array, "samples times"], Float[Array, "samples neurons times 3"]]:
+    """Takes an instance of `Solution` from `SpikingNeuralNet.__call__(...)` and outputs the times
+    and values of the internal neuron states in a plottable format.
+
+    **Arguments**:
+
+    - `sol`: An instance of `Solution` as returned from `SpikingNeuralNet.__call__(...)`.
+
+    **Returns**:
+
+    - `ts`: The time axis of the path of shape `(samples, times)`.
+    - `ys`: The values of the internal state of the neuron of shape `(samples, neurons, times, 3)`.
+    """
+
+    @jax.vmap
+    def _plottable_neuron(ts, ys):
+        t0 = ts[0, 0]
+        t1 = sol.t1
+        _, neurons, times, _ = ys.shape
+        ys = ys.transpose((1, 0, 2, 3))
+        ts_out = jnp.linspace(t0, t1, times)
+        ts_flat = ts.flatten()
+        ys_flat = ys.reshape((neurons, -1, 3))
+        sort_idx = jnp.argsort(ts_flat)
+        ts_flat = ts_flat[sort_idx]
+        ys_flat = ys_flat[:, sort_idx, :]
+        idx = jnp.searchsorted(ts_flat, ts_out)
+        ys_out = ys_flat[:, idx, :]
+        return ts_out, ys_out
+
+    return _plottable_neuron(sol.ts, sol.ys)
+
+
+def interleave(arr1: Array, arr2: Array) -> Array:
+    out = jnp.empty((arr1.size + arr2.size,), dtype=arr1.dtype)
+    out = out.at[0::2].set(arr2)
+    out = out.at[1::2].set(arr1)
+    return out
+
+
+def marcus_lift(
+    t0: RealScalarLike,
+    t1: RealScalarLike,
+    spike_times: Float[Array, " max_spikes"],
+    spike_mask: Float[Array, "max_spikes num_neurons"],
+) -> Float[Array, " 2_max_spikes"]:
+    """Lifts a spike train to a discretisation of the Marcus lift
+    (with time augmentation).
+
+    **Arguments**:
+
+    - `t0`: The start time of the path.
+    - `t1`: The end time of the path.
+    - `spike_times`: The times of the spikes.
+    - `spike_mask`: A mask indicating the corresponding spiking neuron.
+
+    **Returns**:
+
+    - An array of shape `(2 * max_spikes, num_neurons + 1)` representing the Marcus lift.
+    """
+    num_neurons = spike_mask.shape[1]
+    finite_spikes = jnp.where(jnp.isfinite(spike_times), spike_times, t1).reshape((-1, 1))
+    spike_cumsum = jnp.cumsum(spike_mask, axis=0)
+    # last_spike_time = jnp.max(jnp.where(spike_times < t1, spike_times, -jnp.inf))
+    spike_cumsum_shift = jnp.roll(spike_cumsum, 1, axis=0)
+    spike_cumsum_shift = spike_cumsum_shift.at[0, :].set(
+        jnp.zeros(num_neurons, dtype=spike_cumsum_shift.dtype)
+    )
+    arr1 = jnp.hstack([finite_spikes, spike_cumsum])
+    arr2 = jnp.hstack([finite_spikes, spike_cumsum_shift])
+    out = jax.vmap(interleave, in_axes=1)(arr1, arr2).T
+    # Makes sure the path starts at t0
+    out = jnp.roll(out, 1, axis=0)
+    out = out.at[0, :].set(jnp.insert(jnp.zeros(num_neurons), 0, t0))
+    # time_capped = jnp.where(out[:, 0] < t1, out[:, 0], last_spike_time)
+    # out = out.at[:, 0].set(time_capped)
+    return out
+
+
+@eqx.filter_jit
+def cap_fill_ravel(ts, ys, spike_cap=10):
+    # Cap the number of spikes
+    ys_capped = ys[:spike_cap]
+    ts_capped = ts[:spike_cap]
+    spikes, neurons, times, _ = ys_capped.shape
+
+    # Fill up infs
+    idx = ts_capped > ts_capped[:, -1, None]
+    idx_y = jnp.tile(idx[:, None, :, None], (1, neurons, 1, 3))
+    ts_capped = jnp.where(idx, ts_capped[:, -1, None], ts_capped)
+    ys_capped = jnp.where(idx_y, ys_capped[:, :, -1, None, :], ys_capped)
+
+    xs = (ts_capped, ys_capped)
+    carry_ys = jnp.zeros((neurons, times, 3))
+    carr_ts = jnp.array(0.0)
+    carry = (carr_ts, carry_ys)
+
+    def _fill(carry, x):
+        _ts, _ys = x
+        carry_ts, carry_ys = carry
+        _ys_fill_val = jnp.tile(_ys[:, None, -1], (1, times, 1))
+        _ts_fill_val = _ts[-1]
+        _ys_out = jnp.where(jnp.isinf(_ys), _ys_fill_val, _ys)
+        _ts_out = jnp.where(jnp.isinf(_ts), _ts_fill_val, _ts)
+        assert isinstance(_ys_out, Array)
+        _ys_all_inf = jnp.all(jnp.isinf(_ys_out))
+        _ts_all_inf = jnp.all(jnp.isinf(_ts_out))
+        _ys_out = jnp.where(_ys_all_inf, carry_ys, _ys_out)
+        _ts_out = jnp.where(_ts_all_inf, carry_ts, _ts_out)
+        assert isinstance(_ys_out, Array)
+        new_carry_ys = jnp.tile(_ys_out[:, None, -1], (1, times, 1))
+        new_carry_ts = _ts_out[-1]
+        new_carry = (new_carry_ts, new_carry_ys)
+        out = (_ts_out, _ys_out)
+        return new_carry, out
+
+    _, xs_filled_capped = jax.lax.scan(_fill, carry, xs=xs)
+    ts_filled_capped, ys_filled_capped = xs_filled_capped
+
+    # Ravel out the "spikes" dimension
+    # (spikes, neurons, times, 3) -> (neurons, spikes, times, 3)
+    ys_filled_capped = jnp.transpose(ys_filled_capped, (1, 0, 2, 3))
+    # (spikes, neurons, times, 3) -> (neurons, spikes*times, 3)
+    ys_filled_capped_ravelled = ys_filled_capped.reshape((neurons, -1, 3))
+    ts_filled_capped_ravelled = jnp.ravel(ts_filled_capped)
+    return ts_filled_capped_ravelled, ys_filled_capped_ravelled
+
+
+class SpikeTrain(AbstractPath):
+    t0: Real
+    t1: Real
+    num_spikes: int
+    spike_times: Array
+    spike_cumsum: Array
+    num_neurons: int
+
+    def __init__(self, t0, t1, spike_times, spike_mask):
+        max_spikes, num_neurons = spike_mask.shape
+        self.num_neurons = num_neurons
+        self.t0 = t0
+        self.t1 = t1
+        self.num_spikes = spike_times.shape[0]
+        self.spike_times = jnp.insert(spike_times, 0, t0)
+        self.spike_cumsum = jnp.cumsum(
+            jnp.insert(spike_mask, 0, jnp.full_like(spike_mask[0], False), axis=0), axis=0
+        )
+
+    def evaluate(self, t0: Real, t1: Optional[Real] = None, left: Optional[bool] = True) -> Array:
+        del left
+        if t1 is not None:
+            return self.evaluate(t1 - t0)
+        idx = jnp.searchsorted(self.spike_times, t0)
+        idx = jnp.where(idx > 0, idx - 1, idx)
+        out = jax.lax.dynamic_slice(self.spike_cumsum, (idx, 0), (self.num_neurons, 1))[:, 0]
+        return out
+
+
+class SingleSpikeTrain(AbstractPath):
+    t0: Real
+    t1: Real
+    spike_times: Array
+
+    def evaluate(self, t0: Real, t1: Optional[Real] = None, left: Optional[bool] = True) -> Array:
+        del left
+        if t1 is not None:
+            return self.evaluate(t1 - t0)
+        return jnp.where(self.spike_times >= t0, 1.0, 0.0)
+
+
+# A version of VirtualBrownianTree that will not throw an error when differentiated
+class BrownianPath(VirtualBrownianTree):
+    @eqxi.doc_remove_args("_spline")
+    def __init__(
+        self,
+        t0: RealScalarLike,
+        t1: RealScalarLike,
+        tol: RealScalarLike,
+        shape: Union[tuple[int, ...], PyTree[jax.ShapeDtypeStruct]],
+        key: PRNGKeyArray,
+        levy_area: type[Union[BrownianIncrement, SpaceTimeLevyArea]] = BrownianIncrement,
+        _spline: _Spline = "sqrt",
+    ):
+        super().__init__(t0, t1, tol, shape, key, levy_area, _spline)
+
+    @eqx.filter_jit
+    def evaluate(
+        self,
+        t0: RealScalarLike,
+        t1: Optional[RealScalarLike] = None,
+        left: bool = True,
+        use_levy: bool = False,
+    ) -> Union[PyTree[Array], BrownianIncrement, SpaceTimeLevyArea]:
+        t0 = jax.lax.stop_gradient(t0)
+        # map the interval [self.t0, self.t1] onto [0,1]
+        t0 = linear_rescale(self.t0, t0, self.t1)
+        levy_0 = self._evaluate(t0)
+        if t1 is None:
+            levy_out = levy_0
+            levy_out = jtu.tree_map(_make_levy_val, self.shape, levy_out)
+        else:
+            t1 = jax.lax.stop_gradient(t1)
+            # map the interval [self.t0, self.t1] onto [0,1]
+            t1 = linear_rescale(self.t0, t1, self.t1)
+            levy_1 = self._evaluate(t1)
+            levy_out = jtu.tree_map(_levy_diff, self.shape, levy_0, levy_1)
+
+        levy_out = levy_tree_transpose(self.shape, levy_out)
+        # now map [0,1] back onto [self.t0, self.t1]
+        levy_out = self._denormalise_bm_inc(levy_out)
+        assert isinstance(levy_out, (BrownianIncrement, SpaceTimeLevyArea))
+        return levy_out if use_levy else levy_out.W
+
 
 
 # Work around JAX issue #22011, similar to what's in snn.py
@@ -29,16 +430,17 @@ ad.primitive_transposes[stop_gradient_p] = stop_gradient_transpose
 
 class NetworkState(eqx.Module):
     ts: Real[Array, "samples spikes times"]
-    ys: Float[Array, "samples spikes neurons times 8"]
+    ys: Float[Array, "samples spikes neurons times state_vars"]  # Flexible state variables
     tevents: eqxi.MaybeBuffer[Real[Array, "samples spikes"]]
     t0: Real[Array, " samples"]
-    y0: Float[Array, "samples neurons 8"]
+    y0: Float[Array, "samples neurons 8"]  # Still need full state for dynamics
     #Add synaptic_currents so we can directly modify when a neuron spikes
     synaptic_I: Float[Array, "samples neurons"]
     num_spikes: int
     event_mask: Bool[Array, "samples neurons"]
     event_types: eqxi.MaybeBuffer[Bool[Array, "samples spikes neurons"]]
     key: Any
+    stored_vars: tuple = eqx.field(static=True, default=('Vs',))
 
 
 def buffers(state: NetworkState):
@@ -358,6 +760,8 @@ class MotoneuronNetwork(eqx.Module):
         num_save: Int = 2,
         dt0: Real = 0.01,
         max_steps: Int = 1000,
+        store_vars: tuple = ('Vs',),  # Which state variables to store (default: only somatic voltage)
+        memory_efficient: bool = True,  # Whether to use memory-efficient storage
     ):
         """
         Run the network simulation.
@@ -383,6 +787,11 @@ class MotoneuronNetwork(eqx.Module):
         # ic_shape = jax.eval_shape(input_current, 0.0)
         # assert ic_shape.shape == (self.num_neurons,)
         
+
+        #check is store_vars is a tuple
+        if not isinstance(store_vars, tuple):
+            raise ValueError("store_vars must be a tuple of state variable names.")
+        
         # Convert scalar t0 to array for each sample
         t0, t1 = float(t0), float(t1)
         _t0 = jnp.broadcast_to(t0, (num_samples,))
@@ -404,11 +813,38 @@ class MotoneuronNetwork(eqx.Module):
                 return input_w_large
                 
         # Initialize state if not provided
-      
         y0 = self._initialize_state(num_samples, init_key)
             
-        # Initialize storage arrays for results
-        ys = jnp.full((num_samples, max_spikes, self.num_neurons, num_save, 8), jnp.inf)
+        # Determine which state variables to store and their indices
+        if memory_efficient:
+            # Map state variable names to their indices
+            state_var_indices = {
+                'Vs': 0,  # Somatic voltage
+                'Vd': 1,  # Dendritic voltage
+                'n': 2,   # n gate
+                'h': 3,   # h gate
+                's': 4,   # s gate
+                'c': 5,   # c gate
+                'q': 6,   # q gate
+                'Ca': 7,  # Calcium concentration
+            }
+            
+            # Validate requested state variables
+            for var in store_vars:
+                if var not in state_var_indices:
+                    raise ValueError(f"Unknown state variable: {var}")
+            
+            # Number of state variables to store
+            num_state_vars = len(store_vars)
+            
+            # Initialize storage with only the requested state variables
+            ys = jnp.full((num_samples, max_spikes, self.num_neurons, num_save, num_state_vars), jnp.inf)
+        else:
+            # Store all 8 state variables (original behavior)
+            store_vars = ('Vs', 'Vd', 'n', 'h', 's', 'c', 'q', 'Ca')
+            ys = jnp.full((num_samples, max_spikes, self.num_neurons, num_save, 8), jnp.inf)
+        
+        # Initialize other storage arrays
         ts = jnp.full((num_samples, max_spikes, num_save), jnp.inf)
         tevents = jnp.full((num_samples, max_spikes), jnp.inf)
         num_spikes = 0
@@ -421,15 +857,16 @@ class MotoneuronNetwork(eqx.Module):
         # Create initial state
         init_state = NetworkState(
             ts=ts,
-            ys= ys, 
+            ys=ys, 
             tevents=tevents,
-            t0= _t0, 
+            t0=_t0, 
             y0=y0, 
             num_spikes=num_spikes, 
             event_mask=event_mask, 
             event_types=event_types, 
             key=key,
             synaptic_I=init_synaptic_I,
+            stored_vars=store_vars,
         )
         
         # Setup diffrax solver
@@ -541,14 +978,16 @@ class MotoneuronNetwork(eqx.Module):
                 tevent = eqxi.error_if(tevent, jnp.isnan(tevent), "tevent is nan")
                 
                 assert sol.ys is not None
-                ys = sol.ys[0]
+                full_ys = sol.ys[0]  # Get the full state array from solver
                 _y1 = sol.ys[1]
+                
+                # Get event state (all 8 variables needed for next iteration)
                 yevent = _y1[0].reshape((self.num_neurons, 8))
                 yevent = jnp.where(_t0 < t1, yevent, y0)
                 yevent = eqxi.error_if(yevent, jnp.any(jnp.isnan(yevent)), "yevent is nan")
                 yevent = eqxi.error_if(yevent, jnp.any(jnp.isinf(yevent)), "yevent is inf")
                 
-                # Determine which neurons spiked
+                # Determine which neurons spiked (always use Vs for spike detection)
                 event_array = jnp.array(yevent[:, 0] > self.threshold - 1e-3)
                 # event_array = jnp.array(sol.event_mask)
                 w_update_t = jnp.where(
@@ -562,10 +1001,38 @@ class MotoneuronNetwork(eqx.Module):
                 # Update synaptic currents
                 # new_dI = jnp.dot(event_array.astype(self.w.dtype), self.w) / self.p
                 new_dI = jnp.sum(w_update_t, axis=-1) / self.p
-                # jax.debug.print("new_dI: {x}", x=new_dI)
                 
-                # Reshape outputs
-                ys = jnp.transpose(ys, (1, 0, 2))
+                # Reshape the full outputs
+                full_ys = jnp.transpose(full_ys, (1, 0, 2))
+                
+                # Memory-efficient storage: extract only the requested state variables
+                if memory_efficient:
+                    # Map state variable names to their indices
+                    state_var_indices = {
+                        'Vs': 0,  # Somatic voltage
+                        'Vd': 1,  # Dendritic voltage
+                        'n': 2,   # n gate
+                        'h': 3,   # h gate
+                        's': 4,   # s gate
+                        'c': 5,   # c gate
+                        'q': 6,   # q gate
+                        'Ca': 7,  # Calcium concentration
+                    }
+                    
+                    # Extract only the requested variables by index
+                    indices = [state_var_indices[var] for var in store_vars]
+                    
+                    # If only storing one variable
+                    if len(indices) == 1:
+                        ys = full_ys[..., indices[0]]
+                        # Add a dimension to maintain expected shape
+                        ys = jnp.expand_dims(ys, axis=-1)
+                    else:
+                        # Extract multiple variables
+                        ys = jnp.stack([full_ys[..., idx] for idx in indices], axis=-1)
+                else:
+                    # Return all state variables (original behavior)
+                    ys = full_ys
                 
                 return ts, ys, tevent, ytrans, event_array, new_dI
                 
@@ -606,6 +1073,7 @@ class MotoneuronNetwork(eqx.Module):
                 event_types=event_types,
                 key=new_key,
                 synaptic_I=new_synaptic_I,
+                stored_vars=store_vars,
             )
 
             
@@ -643,137 +1111,121 @@ class MotoneuronNetwork(eqx.Module):
             spike_marks=spike_marks,
             num_spikes=num_spikes,
             max_spikes=max_spikes,
+            stored_vars=store_vars,  # Include which variables were stored
             # synaptic_I=after_spike_I,
         )
         
         return sol
     
-    def plot_simulation_results(
-        self,
-        sol: Solution,
-        neurons_to_plot: Optional[Sequence[Int]] = None,
-        plot_spikes: bool = True,
-        plot_dendrite: bool = True  # New parameter to control Vd plotting
-        ):
-        num_samples = sol.ys.shape[0]
-        Vs_index = 0  # Index for somatic voltage (Vs)
-        Vd_index = 1  # Index for dendritic voltage (Vd)
+def plot_simulation_results(
+    sol: Solution,
+    neurons_to_plot: Optional[Sequence[Int]] = None,
+    plot_spikes: bool = True,
+    plot_dendrite: bool = True  # Parameter to control Vd plotting
+):
+    """
+    Plot voltage traces from a simulation solution.
+    
+    Args:
+        sol: Solution object containing simulation results
+        neurons_to_plot: Specific neurons to plot. If None, plots all neurons
+        plot_spikes: Whether to mark spike times on the plot
+        plot_dendrite: Whether to plot dendritic voltage traces (if available)
+    """
+    num_samples = sol.ys.shape[0]
+    num_neurons = sol.ys.shape[2]  # Extract neuron count from solution
+    
+    # Check if dendrite plotting is possible
+    if plot_dendrite and hasattr(sol, 'stored_vars'):
+        if 'Vd' not in sol.stored_vars:
+            plot_dendrite = False
+            print("Warning: Dendritic voltage (Vd) not stored, dendrite plotting disabled")
+    
+    if neurons_to_plot is None:
+        neurons_to_plot = range(num_neurons)
+    elif not isinstance(neurons_to_plot, Sequence) or not all(isinstance(n, int) for n in neurons_to_plot):
+        raise ValueError("neurons_to_plot must be a sequence of integers or None.")
 
-        if neurons_to_plot is None:
-            neurons_to_plot = range(self.num_neurons)
-        elif not isinstance(neurons_to_plot, Sequence) or not all(isinstance(n, int) for n in neurons_to_plot):
-             raise ValueError("neurons_to_plot must be a sequence of integers or None.")
+    for sample_idx in range(num_samples):
+        plt.figure(figsize=(12, 6))
+        print(f"Processing plot for Sample {sample_idx}...")
+        
+        plotted_lines = []
+        plotted_labels = []
 
-        for sample_idx in range(num_samples):
-            plt.figure(figsize=(12, 6)) 
+        # Iterate through the neurons requested for plotting
+        for neuron_index in neurons_to_plot:
+            if neuron_index < 0 or neuron_index >= num_neurons:
+                print(f"Warning: Neuron index {neuron_index} out of range (0-{num_neurons-1}). Skipping.")
+                continue
 
-            print(f"Processing plot for Sample {sample_idx}...")
-
-            valid_spike_count_sample = jnp.sum(jnp.isfinite(sol.spike_times[sample_idx, :]))
-            num_segments_to_process = valid_spike_count_sample + 1  # Segments = spikes + 1 (initial/final)
-            num_segments_to_process = min(num_segments_to_process, sol.max_spikes) 
-
-            plotted_lines = []
-            plotted_labels = []
-
-            # Iterate through the neurons requested for plotting
-            for neuron_index in neurons_to_plot:
-                if neuron_index < 0 or neuron_index >= self.num_neurons:
-                    print(f"Warning: Neuron index {neuron_index} out of range (0-{self.num_neurons-1}). Skipping.")
-                    continue
-
-                # Process somatic voltage (Vs)
-                all_ts_neuron = []
-                all_vs_neuron = []
+            # Get somatic voltage using the Solution's method
+            v_data = sol.get_voltages(sample_idx, neuron_index)
+            
+            if len(v_data['times']) > 0:
+                # Plot soma voltage
+                line_soma, = plt.plot(v_data['times'], v_data['Vs'], 
+                                     label=f"Neuron {neuron_index} (Soma)",
+                                     color=f"C{neuron_index}")
+                plotted_lines.append(line_soma)
+                plotted_labels.append(f"Neuron {neuron_index} (Soma)")
                 
-                # Process dendritic voltage (Vd) if requested
-                all_vd_neuron = [] if plot_dendrite else None
-
-                # Iterate through the segments for this neuron and sample
-                for spike_idx in range(num_segments_to_process):
-                    ts_seg = sol.ts[sample_idx, spike_idx, :]
-                    vs_seg = sol.ys[sample_idx, spike_idx, neuron_index, :, Vs_index]
-                    
-                    if plot_dendrite:
-                        vd_seg = sol.ys[sample_idx, spike_idx, neuron_index, :, Vd_index]
-                        valid_indices = jnp.isfinite(ts_seg) & jnp.isfinite(vs_seg) & jnp.isfinite(vd_seg)
-                    else:
-                        valid_indices = jnp.isfinite(ts_seg) & jnp.isfinite(vs_seg)
-                    
-                    valid_ts = ts_seg[valid_indices]
-                    valid_vs = vs_seg[valid_indices]
-                    
-                    if plot_dendrite:
-                        valid_vd = vd_seg[valid_indices]
-
-                    if valid_ts.size > 0:
-                        all_ts_neuron.append(valid_ts)
-                        all_vs_neuron.append(valid_vs)
-                        if plot_dendrite:
-                            all_vd_neuron.append(valid_vd)
-
-                if all_ts_neuron:
-                    # Process soma voltage
-                    full_ts = jnp.concatenate(all_ts_neuron)
-                    full_vs = jnp.concatenate(all_vs_neuron)
-                    
-                    sort_indices = jnp.argsort(full_ts)
-                    full_ts_sorted = full_ts[sort_indices]
-                    full_vs_sorted = full_vs[sort_indices]
-
-                    # Remove duplicates
-                    unique_ts, unique_indices = jnp.unique(full_ts_sorted, return_index=True)
-                    unique_vs = full_vs_sorted[unique_indices]
-
-                    # Plot soma voltage
-                    line_soma, = plt.plot(unique_ts, unique_vs, label=f"Neuron {neuron_index} (Soma)", 
-                                         color=f"C{neuron_index}")
-                    plotted_lines.append(line_soma)
-                    plotted_labels.append(f"Neuron {neuron_index} (Soma)")
-                    
-                    # Plot dendrite voltage if requested
-                    if plot_dendrite and all_vd_neuron:
-                        full_vd = jnp.concatenate(all_vd_neuron)
-                        full_vd_sorted = full_vd[sort_indices]
-                        unique_vd = full_vd_sorted[unique_indices]
-                        
-                        line_dend, = plt.plot(unique_ts, unique_vd, label=f"Neuron {neuron_index} (Dendrite)",
-                                             linestyle='--', color=f"C{neuron_index}")
+                # Plot dendrite voltage if requested
+                if plot_dendrite:
+                    # Get dendritic voltage using the Solution's method
+                    vd_data = sol.get_dendrite_voltages(sample_idx, neuron_index)
+                    if len(vd_data['times']) > 0:
+                        line_dend, = plt.plot(vd_data['times'], vd_data['Vd'],
+                                            label=f"Neuron {neuron_index} (Dendrite)",
+                                            linestyle='--', color=f"C{neuron_index}")
                         plotted_lines.append(line_dend)
                         plotted_labels.append(f"Neuron {neuron_index} (Dendrite)")
-                else:
-                     print(f"No valid data found for Neuron {neuron_index} in Sample {sample_idx}.")
+            else:
+                print(f"No valid data found for Neuron {neuron_index} in Sample {sample_idx}.")
 
-            # Plot spike markers
-            if plot_spikes:
-                 valid_spike_times = sol.spike_times[sample_idx][jnp.isfinite(sol.spike_times[sample_idx])]
-                 added_spike_legend = False
-                 if len(plotted_lines) > 0:
-                    min_t, max_t = plt.xlim() # Get current plot time range
-                    for spike_t in valid_spike_times:
-                        if spike_t >= min_t and spike_t <= max_t :
-                            label = 'Spike' if not added_spike_legend else ""
-                            plt.axvline(spike_t, color='r', linestyle='--', alpha=0.6, label=label)
-                            added_spike_legend = True
+        # Plot spike markers
+        if plot_spikes:
+            # Use get_spikes method to get valid spike times
+            valid_spike_times = sol.get_spikes(sample_idx)
+            added_spike_legend = False
+            if len(plotted_lines) > 0:
+                min_t, max_t = plt.xlim() # Get current plot time range
+                for spike_t in valid_spike_times:
+                    if spike_t >= min_t and spike_t <= max_t:
+                        label = 'Spike' if not added_spike_legend else ""
+                        plt.axvline(spike_t, color='r', linestyle='--', alpha=0.6, label=label)
+                        added_spike_legend = True
 
-            # Finalize plot for the current sample
-            plt.xlabel("Time (ms)")
-            plt.ylabel("Voltage (mV)")
-            plt.title(f"Sample {sample_idx}: Neuron Voltage Traces")
-            
-            if plotted_lines:
-                custom_legend_handles = plotted_lines
-                custom_legend_labels = plotted_labels
-                if plot_spikes and added_spike_legend:
-                     from matplotlib.lines import Line2D
-                     spike_legend_entry = Line2D([0], [0], color='r', linestyle='--', alpha=0.6, label='Spike')
-                     custom_legend_handles.append(spike_legend_entry)
-                     custom_legend_labels.append('Spike')
+        # Finalize plot for the current sample
+        plt.xlabel("Time (ms)")
+        plt.ylabel("Voltage (mV)")
+        plt.title(f"Sample {sample_idx}: Neuron Voltage Traces")
+        
+        if plotted_lines:
+            custom_legend_handles = plotted_lines
+            custom_legend_labels = plotted_labels
+            if plot_spikes and added_spike_legend:
+                from matplotlib.lines import Line2D
+                spike_legend_entry = Line2D([0], [0], color='r', linestyle='--', alpha=0.6, label='Spike')
+                custom_legend_handles.append(spike_legend_entry)
+                custom_legend_labels.append('Spike')
 
-                plt.legend(handles=custom_legend_handles, labels=custom_legend_labels)
+            plt.legend(handles=custom_legend_handles, labels=custom_legend_labels)
 
-            plt.grid(True)
-            plt.show() # Show the plot for the current sample
+        plt.grid(True)
+        plt.show() # Show the plot for the current sample
+
+
+# Add a wrapper method to the MotoneuronNetwork class for compatibility
+def _motoneuron_plot_wrapper(self, sol, **kwargs):
+    """
+    Wrapper for the standalone plotting function to maintain backward compatibility.
+    """
+    return plot_simulation_results(sol, **kwargs)
+
+
+# Add the wrapper method to MotoneuronNetwork class
+MotoneuronNetwork.plot_simulation_results = _motoneuron_plot_wrapper
 ############################
 # Example usage
 
