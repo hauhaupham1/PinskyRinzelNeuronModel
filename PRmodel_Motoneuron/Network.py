@@ -297,6 +297,7 @@ class MotoneuronNetwork(eqx.Module):
         memory_efficient: bool = True,  # Whether to use memory-efficient storage
         spike_only: bool = False,  # If True, only store spike times
         discard_voltage_between_spikes: bool = False,  # If True, only keep voltage near spikes
+        is_final_simulation: bool = True,  # If True, include end spike at t1 (not for chunks)
         # Solver continuity parameters
         solver_state0: Optional[PyTree] = None,
         controller_state0: Optional[PyTree] = None,
@@ -539,7 +540,18 @@ class MotoneuronNetwork(eqx.Module):
                 # spike_time_to_store should be inf if no actual spike event happened for this segment.
                 # This means tevent_out should be the actual event time if an event happened, otherwise t1_scalar.
                 # We need to distinguish between reaching t1_scalar and an event happening.
-                spike_time_to_store_out = jnp.where(event_happened_out, tevent_out, jnp.inf)
+                # Only record the end time if it's actually the final simulation AND we reached t1 without spike
+                # This prevents recording intermediate chunk boundaries as "spikes"
+                is_final_time = jnp.abs(tevent_out - t1_scalar) < 1e-10
+                spike_time_to_store_out = jnp.where(
+                    event_happened_out,  # If real spike happened
+                    tevent_out,          # Record the spike time
+                    jnp.where(
+                        is_final_simulation & is_final_time,  # If final sim AND reached t1 without spike
+                        tevent_out,      # Record t1 (snnax behavior)
+                        jnp.inf          # Otherwise, don't record (intermediate boundary)
+                    )
+                )
                 assert sol.ys is not None
                 full_ys_from_sol = sol.ys[0]  # Saved states for this segment
                 _y1_from_sol = sol.ys[1] # State at the end of this segment
@@ -619,8 +631,10 @@ class MotoneuronNetwork(eqx.Module):
             ts_updated = state.ts.at[:, state.num_spikes].set(_ts_seg_data)
             ys_updated = state.ys.at[:, state.num_spikes].set(_ys_seg_data)
 
+            # Only record event types when we actually have a spike time to record
+            should_record = jnp.isfinite(_spike_time_to_store_val)
             event_types_updated = state.event_types.at[:, state.num_spikes].set(
-                jnp.where(_event_happened_val[:, None], _event_mask_neurons, jnp.zeros_like(_event_mask_neurons))
+                jnp.where(should_record[:, None], _event_mask_neurons, jnp.zeros_like(_event_mask_neurons))
             )
 
             tevents_updated = state.tevents.at[:, state.num_spikes].set(_spike_time_to_store_val)
@@ -648,13 +662,8 @@ class MotoneuronNetwork(eqx.Module):
             
         # Define stopping condition for the while_loop
         def stop_fn(state: NetworkState) -> bool:
-            # Continue if we haven't exceeded max_spikes AND 
-            # the start time for the next segment (state.t0) is less than the overall end time (t1_scalar)
-            # for ALL samples.
-            # If any sample's state.t0 has reached t1_scalar, and an event happened, it might stop.
-            # If no event happened, state.t0 became t1_scalar, so reached_end is true.
-            reached_end = jnp.all(state.t0 >= t1_scalar) 
-            return (state.num_spikes < max_spikes) & (~reached_end)
+            # Match snnax behavior: continue while num_spikes <= max_spikes AND min(t0) < t1
+            return (state.num_spikes <= max_spikes) & (jnp.min(state.t0) < t1_scalar)
             
         # Run simulation using eqxi.while_loop
         final_loop_state = eqxi.while_loop(
@@ -732,6 +741,9 @@ def run_chunked_simulation(
         if chunk_t0_loop >= chunk_t1_loop:
             continue
         
+        # Determine if this is the final chunk
+        is_final_chunk = (chunk_t1_loop >= t1)
+        
         key, chunk_key = jr.split(key)
         chunk_sol: Solution = network(
             input_current=input_current,
@@ -748,6 +760,7 @@ def run_chunked_simulation(
             spike_only=spike_only,
             store_vars=store_vars,
             memory_efficient=memory_efficient,
+            is_final_simulation=is_final_chunk,  # Only allow end spike for final chunk
             solver_state0=current_solver_state_jax,
             controller_state0=current_controller_state_jax,
             made_jump0=current_made_jump_jax,
