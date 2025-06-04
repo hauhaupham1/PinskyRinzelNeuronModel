@@ -68,6 +68,7 @@ def marcus_lift(
     t1: RealScalarLike,
     spike_times: Float[Array, " max_spikes"],
     spike_mask: Float[Array, "max_spikes num_neurons"],
+    max_length: Optional[int] = None,
 ) -> Float[Array, " 2_max_spikes"]:
     """Lifts a spike train to a discretisation of the Marcus lift
     (with time augmentation).
@@ -78,10 +79,14 @@ def marcus_lift(
     - `t1`: The end time of the path.
     - `spike_times`: The times of the spikes.
     - `spike_mask`: A mask indicating the corresponding spiking neuron.
+    - `max_length`: Optional maximum length for output. If provided, the output
+                   will be truncated or padded to this length. This ensures
+                   consistent shapes between normal and chunked simulations.
 
     **Returns**:
 
-    - An array of shape `(2 * max_spikes, num_neurons + 1)` representing the Marcus lift.
+    - An array of shape `(2 * max_spikes, num_neurons + 1)` representing the Marcus lift,
+      or `(max_length, num_neurons + 1)` if max_length is specified.
     """
     num_neurons = spike_mask.shape[1]
     finite_spikes = jnp.where(jnp.isfinite(spike_times), spike_times, t1).reshape((-1, 1))
@@ -99,6 +104,20 @@ def marcus_lift(
     out = out.at[0, :].set(jnp.insert(jnp.zeros(num_neurons), 0, t0))
     # time_capped = jnp.where(out[:, 0] < t1, out[:, 0], last_spike_time)
     # out = out.at[:, 0].set(time_capped)
+    
+    # Fix for shape consistency: truncate or pad to max_length if specified
+    if max_length is not None:
+        current_length = out.shape[0]
+        if current_length > max_length:
+            # Truncate to max_length, keeping the most important early time points
+            out = out[:max_length]
+        elif current_length < max_length:
+            # Pad with the last valid state repeated
+            last_row = out[-1:] if current_length > 0 else jnp.array([[t1] + [0.0] * num_neurons])
+            padding_needed = max_length - current_length
+            padding = jnp.tile(last_row, (padding_needed, 1))
+            out = jnp.vstack([out, padding])
+    
     return out
 
 

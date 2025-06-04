@@ -328,7 +328,7 @@ class MotoneuronNetwork(eqx.Module):
         if not isinstance(store_vars, tuple):
             raise ValueError("store_vars must be a tuple of state variable names.")
         # Convert scalar t0 to array for each sample
-        t0_scalar, t1_scalar = float(t0), float(t1) # Keep scalars for non-vmapped parts
+        t0_scalar, t1_scalar = float(t0), float(t1)  # Keep as JAX arrays for compatibility
         _t0_array = jnp.broadcast_to(t0_scalar, (num_samples,)) # For NetworkState.t0
         # Initialize random keys
         key, bm_key = jr.split(key, 2)
@@ -711,6 +711,7 @@ def run_chunked_simulation(
     spike_only: bool = True,  # Default to spike-only for backward compatibility
     store_vars: tuple = ('Vs',),  # Which state variables to store
     memory_efficient: bool = True,  # Whether to use memory-efficient storage
+    max_total_spikes: Optional[Int] = None,  # Fix for Marcus lift shape consistency
     **kwargs
 ) -> Solution:
     if key is None:
@@ -775,8 +776,10 @@ def run_chunked_simulation(
             valid_s_times_jax = s_times_jax[valid_mask_jax]
             valid_s_marks_jax = s_marks_jax[valid_mask_jax]
 
-            valid_s_times_jax.block_until_ready()
-            valid_s_marks_jax.block_until_ready()
+            # Only call block_until_ready if not in gradient computation
+            if hasattr(valid_s_times_jax, 'block_until_ready'):
+                valid_s_times_jax.block_until_ready()
+                valid_s_marks_jax.block_until_ready()
             
             if valid_s_times_jax.shape[0] > 0:
                 all_spike_times_np_per_sample[sample_idx].append(np.array(valid_s_times_jax))
@@ -786,21 +789,26 @@ def run_chunked_simulation(
             if not spike_only:
                 ys_jax = chunk_sol.ys[sample_idx]
                 ts_jax = chunk_sol.ts[sample_idx]
-                ys_jax.block_until_ready()
-                ts_jax.block_until_ready()
+                if hasattr(ys_jax, 'block_until_ready'):
+                    ys_jax.block_until_ready()
+                    ts_jax.block_until_ready()
                 all_ys_np_per_sample[sample_idx].append(np.array(ys_jax))
                 all_ts_np_per_sample[sample_idx].append(np.array(ts_jax))
         
         # --- Update inter-chunk states (convert to NumPy) ---
         if chunk_sol.final_state is not None:
-            final_state_jax = chunk_sol.final_state.block_until_ready()
+            final_state_jax = chunk_sol.final_state
+            if hasattr(final_state_jax, 'block_until_ready'):
+                final_state_jax = final_state_jax.block_until_ready()
             current_y0_np = np.array(final_state_jax)
             del final_state_jax
         else:
             current_y0_np = None
             
         if chunk_sol.final_synaptic_I is not None:
-            final_syn_I_jax = chunk_sol.final_synaptic_I.block_until_ready()
+            final_syn_I_jax = chunk_sol.final_synaptic_I
+            if hasattr(final_syn_I_jax, 'block_until_ready'):
+                final_syn_I_jax = final_syn_I_jax.block_until_ready()
             current_synaptic_I_np = np.array(final_syn_I_jax)
             del final_syn_I_jax
         else:
@@ -813,7 +821,7 @@ def run_chunked_simulation(
         del chunk_sol 
         gc.collect()  
         jax.clear_caches()
-    max_total_spikes = 0
+    actual_max_spikes = 0
     concatenated_spike_times_jax_list = []
     concatenated_spike_marks_jax_list = []
     
@@ -826,25 +834,32 @@ def run_chunked_simulation(
             else: 
                  concat_marks_np = np.empty((0, network.num_neurons), dtype=bool)
 
-
             concatenated_spike_times_jax_list.append(jnp.array(concat_times_np))
             concatenated_spike_marks_jax_list.append(jnp.array(concat_marks_np))
-            max_total_spikes = max(max_total_spikes, concat_times_np.shape[0])
+            actual_max_spikes = max(actual_max_spikes, concat_times_np.shape[0])
         else:
             concatenated_spike_times_jax_list.append(jnp.array([], dtype=jnp.float32))
             concatenated_spike_marks_jax_list.append(jnp.array([], dtype=bool).reshape(0, network.num_neurons))
     
-    if max_total_spikes == 0:
-        max_total_spikes = 1
+    # Use provided max_total_spikes or fall back to actual data size
+    if max_total_spikes is not None:
+        final_max_spikes = max_total_spikes
+    else:
+        final_max_spikes = actual_max_spikes
+    
+    if final_max_spikes == 0:
+        final_max_spikes = 1
 
-    padded_spike_times_jax = jnp.full((num_samples, max_total_spikes), jnp.inf, dtype=jnp.float32)
-    padded_spike_marks_jax = jnp.full((num_samples, max_total_spikes, network.num_neurons), False, dtype=bool)
+    padded_spike_times_jax = jnp.full((num_samples, final_max_spikes), jnp.inf, dtype=jnp.float32)
+    padded_spike_marks_jax = jnp.full((num_samples, final_max_spikes, network.num_neurons), False, dtype=bool)
     
     for sample_idx in range(num_samples):
         num_s = concatenated_spike_times_jax_list[sample_idx].shape[0]
         if num_s > 0:
-            padded_spike_times_jax = padded_spike_times_jax.at[sample_idx, :num_s].set(concatenated_spike_times_jax_list[sample_idx])
-            padded_spike_marks_jax = padded_spike_marks_jax.at[sample_idx, :num_s].set(concatenated_spike_marks_jax_list[sample_idx])
+            # Truncate if necessary to fit within final_max_spikes
+            num_to_set = min(num_s, final_max_spikes)
+            padded_spike_times_jax = padded_spike_times_jax.at[sample_idx, :num_to_set].set(concatenated_spike_times_jax_list[sample_idx][:num_to_set])
+            padded_spike_marks_jax = padded_spike_marks_jax.at[sample_idx, :num_to_set].set(concatenated_spike_marks_jax_list[sample_idx][:num_to_set])
     
     # Handle voltage data concatenation if not in spike_only mode
     if not spike_only:
@@ -880,8 +895,8 @@ def run_chunked_simulation(
                 ts_final = ts_final.at[sample_idx, :num_segs].set(concatenated_ts_list[sample_idx])
     else:
         # Use placeholder arrays for spike_only mode
-        ys_final = jnp.full((num_samples, max_total_spikes, network.num_neurons, 2, 1), jnp.inf)
-        ts_final = jnp.full((num_samples, max_total_spikes, 2), jnp.inf)
+        ys_final = jnp.full((num_samples, final_max_spikes, network.num_neurons, 2, 1), jnp.inf)
+        ts_final = jnp.full((num_samples, final_max_spikes, 2), jnp.inf)
     
     # Final state passed to Solution object should be JAX arrays
     final_state_jax_for_sol = jnp.array(current_y0_np) if current_y0_np is not None else None
@@ -891,7 +906,7 @@ def run_chunked_simulation(
         t1=t1, ys=ys_final, ts=ts_final,
         spike_times=padded_spike_times_jax,
         spike_marks=padded_spike_marks_jax,
-        num_spikes=max_total_spikes, max_spikes=max_total_spikes,
+        num_spikes=final_max_spikes, max_spikes=final_max_spikes,
         stored_vars=store_vars, spike_only=spike_only,
         final_state=final_state_jax_for_sol,
         final_synaptic_I=final_syn_I_jax_for_sol,
