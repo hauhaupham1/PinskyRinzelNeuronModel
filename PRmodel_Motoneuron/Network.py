@@ -9,8 +9,7 @@ Credits:
 import functools as ft
 from typing import Any, Callable, List, Optional, Sequence
 import numpy as np
-import gc
-from diffrax import ODETerm, ConstantStepSize, Event, Euler, SubSaveAt, SaveAt, ControlTerm, MultiTerm, diffeqsolve
+from diffrax import ODETerm, ConstantStepSize, Event, Euler, Tsit5, SubSaveAt, SaveAt, ControlTerm, MultiTerm, diffeqsolve
 import equinox as eqx
 import equinox.internal as eqxi
 import jax
@@ -21,7 +20,6 @@ import optimistix
 from jax._src.ad_util import stop_gradient_p
 from jax.interpreters import ad
 from jaxtyping import Array, Bool, Float, Int, Real, PyTree, ArrayLike
-import jax.tree_util as jtu
 from .solution import Solution
 from .paths import BrownianPath, SingleSpikeTrain
 from .network_state import NetworkState
@@ -75,7 +73,7 @@ class MotoneuronNetwork(eqx.Module):
         wmin: Float = 0.0,
         wmax: Float = 0.5,
         diffusion: bool = False,
-        sigma: Optional[Float[ArrayLike, "2 2"]] = None,
+        sigma: Optional[Float[ArrayLike, "7 7"]] = None,
         key: Optional[Any] = None,
         **pr_params # Allows other PR params to be passed
     ):
@@ -92,7 +90,7 @@ class MotoneuronNetwork(eqx.Module):
             wmin: Minimum weight for random initialization. Defaults to 0.0.
             wmax: Maximum weight for random initialization. Defaults to 0.5.
             diffusion: Whether to include diffusion term in the SDE. Defaults to False.
-            sigma: A 2x2 diffusion matrix. If none, randomly initialized.
+            sigma: A 7x7 diffusion matrix. If none, randomly initialized.
             key: Random key for initialization. If none, set to PRNGKey(0).
             **pr_params: Additional Pinsky-Rinzel model parameters.
         """
@@ -236,13 +234,14 @@ class MotoneuronNetwork(eqx.Module):
         # Add optional diffusion term
         if diffusion:
             if sigma is None:
-                sigma = jr.normal(sigma_key, (2, 2))
+                sigma = jr.normal(sigma_key, (7, 7)) * 0.1
                 sigma = jnp.dot(sigma, sigma.T)
                 self.sigma = sigma
-            sigma_large = jnp.zeros((num_neurons, 8, 2, num_neurons))
-            # Only add noise to voltage components
+
+            sigma_large = jnp.zeros((num_neurons, 8, 7, num_neurons))
+            #Add noise to all gate variables
             for k in range(num_neurons):
-                sigma_large = sigma_large.at[k, :2, :, k].set(sigma)
+                sigma_large = sigma_large.at[k, 1:, :, k].set(sigma)
 
             def diffusion_vf(t, y, args):
                 return sigma_large
@@ -486,7 +485,7 @@ class MotoneuronNetwork(eqx.Module):
                 if self.diffusion_vf is not None:
                     # BrownianPath t0, t1 should span the entire simulation window of this __call__
                     bm = BrownianPath(
-                        t0_scalar -1, t1_scalar + 1, tol=dt0 / 2, shape=(2, self.num_neurons), key=_bm_key_seg 
+                        t0_scalar -1, t1_scalar + 1, tol=dt0 / 2, shape=(7, self.num_neurons), key=_bm_key_seg 
                     )
                     cvf = ControlTerm(self.diffusion_vf, bm)
                     multi_terms.append(cvf)
