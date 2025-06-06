@@ -11,7 +11,6 @@ import time
 from datetime import datetime
 import os
 import sys
-
 import equinox as eqx
 import jax
 import jax.numpy as jnp
@@ -20,45 +19,40 @@ import matplotlib.pyplot as plt
 import numpy as np
 import optax
 from jaxtyping import Array, Float, Real
+import signax
 
 # Add the project root to the path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from PRmodel_Motoneuron.Network import MotoneuronNetwork, run_chunked_simulation
+from PRmodel_Motoneuron.Network import MotoneuronNetwork
 from PRmodel_Motoneuron.paths import marcus_lift
 
-# Try to import signax for proper signature computation
-try:
-    import signax
-    HAS_SIGNAX = True
-except ImportError:
-    print("Warning: signax not available. Using simplified signature loss.")
-    HAS_SIGNAX = False
 
 # Configure JAX
 jax.config.update('jax_platform_name', 'cpu')
-jax.config.update('jax_enable_x64', False)
+jax.config.update('jax_enable_x64', True)
 
 SAVE_IDX = datetime.today().strftime("%Y-%m-%d-%H")
 key = jr.PRNGKey(12345)
 
-# =============================================================================
-# Parameters (mimicking snnax structure)
-# =============================================================================
 
-steps = 1500
+steps = 400
 num_save = 2
 max_spikes = 3
 t0 = 0
 t1 = 100  # 100ms simulation
 dt0 = 1e-2
-
+s = 2
+sigma = jnp.array([[0, s, s, s, s, s, s, s],
+                   [0, s, s, s, s, s, s, s],
+                   [0, s, s, s, s, s, s, s],
+                   [0, s, s, s, s, s, s, s],
+                   [0, s, s, s, s, s, s, s],
+                   [0, s, s, s, s, s, s, s],
+                   [0, s, s, s, s, s, s, s],
+                   [0, s, s, s, s, s, s, s]])
 sample_sizes = [16, 32, 64, 128]
-
 c = 20.0  # input current amplitude (estimand)
 
-# =============================================================================
-# Data Generation Functions (following snnax pattern)
-# =============================================================================
 
 @jax.vmap
 def get_marcus_lifts(spike_times, spike_marks):
@@ -72,11 +66,13 @@ def get_data(data_size, c, key):
         # Constant current like in snnax
         return jnp.array([c])
 
-    # Create PR network (single neuron)
     network = MotoneuronNetwork(
         num_neurons=1,
         threshold=-37.0,
         v_reset=-60.0,
+        diffusion=True,
+        key=key,
+        sigma=sigma,
     )
 
     sol = network(
@@ -117,9 +113,6 @@ def dataloader(data, batch_size, loop, *, key):
         if not loop:
             break
 
-# =============================================================================
-# Model (following snnax SNN class pattern)
-# =============================================================================
 
 class PinskyRinzelModel(eqx.Module):
     """PR model wrapper for parameter estimation (mimicking snnax SNN)."""
@@ -128,27 +121,10 @@ class PinskyRinzelModel(eqx.Module):
     def __call__(self, batch_size, key):
         return get_data(batch_size, self.c, key)
 
-# =============================================================================
-# Loss Functions (following snnax exactly)
-# =============================================================================
-
 def expected_signature(y: Float[Array, ""], depth: int) -> Array:
     """Compute expected signature using signax (following snnax)."""
-    if HAS_SIGNAX:
-        signatures = jax.vmap(ft.partial(signax.signature, depth=depth))(y)
-        return jnp.mean(signatures, axis=0)
-    else:
-        # Fallback: simplified signature moments
-        def signature_moments(path):
-            coords = path[:, 0]
-            increments = jnp.diff(coords, prepend=0.0)
-            return jnp.array([
-                jnp.sum(increments),
-                jnp.sum(increments ** 2),
-                jnp.sum(jnp.abs(increments)),
-            ])
-        signatures = jax.vmap(signature_moments)(y)
-        return jnp.mean(signatures, axis=0)
+    signatures = jax.vmap(ft.partial(signax.signature, depth=depth))(y)
+    return jnp.mean(signatures, axis=0)
 
 @eqx.filter_jit
 def expected_signature_loss(
@@ -217,9 +193,7 @@ def fs_mae_loss(model, data, batch_size, key, n=1):
     spike_trains_gen = model(batch_size, key)
     return spike_MAE_loss(spike_trains_gen, data, n=n)
 
-# =============================================================================
-# Training Loop (following snnax pattern exactly)
-# =============================================================================
+
 
 @eqx.filter_jit
 def make_step(model, grad_loss, optim, data, batch_size, opt_state, key):
@@ -250,15 +224,13 @@ def train(
         step_key,
     ) = jr.split(key, 5)
 
-    c_init = jr.uniform(c_key, minval=20.0, maxval=40.0)  # Random initial guess
+    c_init = jr.uniform(c_key, minval=10, maxval=40.0)  # Random initial guess
     generator = PinskyRinzelModel(c=c_init)
 
     grad_loss = eqx.filter_value_and_grad(loss)
     if test_loss is None:
         test_loss = ft.partial(fs_mae_loss, n=max_spikes)
 
-    # Generate data: We do it in batches since if the data size is too large
-    # the underlying DE that is solved won't be too high-dimensional.
     assert data_size % batch_size == 0
     num_batches = data_size // batch_size
     spike_trains = jnp.zeros((data_size, 2 * max_spikes, 2))
@@ -280,8 +252,8 @@ def train(
     c_hist = []
     # Increase learning rate for c=20 case
     if c <= 20:
-        lr = lr * 10  # Use 10x higher learning rate for lower currents
-    optim = optax.rmsprop(lr, decay=0.7, momentum=0.3)
+        lr = lr   
+    optim = optax.rmsprop(lr*2, decay=0.7, momentum=0.3)
     opt_state = optim.init(eqx.filter(generator, eqx.is_inexact_array))
     infinite_dataloader = dataloader(data, batch_size, loop=True, key=dataloader_key)
 
@@ -320,14 +292,10 @@ def train(
     }
     return results
 
-# =============================================================================
-# Main execution (following snnax pattern)
-# =============================================================================
 
 def main():
     """Main execution following snnax notebook pattern."""
     
-    # Define loss functions to test (following snnax)
     loss_fns = {
         "sig_mmd": ft.partial(spike_train_es_loss, depth=3),
         "fs_mse": ft.partial(fs_loss, n=3),
@@ -346,14 +314,13 @@ def main():
             pickle.dump(res_dict[k], f)
         print(f"Results saved to {fname}")
 
-    # Plot results (following snnax pattern)
     def plot_results(res_list, name):
         fig, ax = plt.subplots(nrows=1, ncols=2, figsize=(10, 5))
         for res in res_list:
             n = res["sample_size"]
-            test_loss_hist = res["test_loss_hist"]
+            loss_hist = res["loss_hist"]
             c_hist = res["c_hist"]
-            ax[0].plot(test_loss_hist, lw=1, alpha=0.7, label=f"{n}")
+            ax[0].plot(loss_hist, lw=1, alpha=0.7, label=f"{n}")
             ax[1].plot(c_hist, lw=1, alpha=0.7)
         
         ax[0].set_title("Test Loss")
@@ -367,7 +334,6 @@ def main():
         ax[0].set_xlabel("Step")
         ax[1].set_xlabel("Step")
 
-        # Save figure
         plt.savefig(f"./pr_single_neuron_{name}_{SAVE_IDX}.pdf", dpi=200, bbox_inches="tight")
         plt.show()
 
@@ -375,7 +341,6 @@ def main():
         print(f"\nPlotting results for {k}...")
         plot_results(res_dict[k], k)
 
-    # Print final results
     print(f"\nTrue c: {c}")
     for k in loss_fns.keys():
         print(f"\n{k.upper()} results:")
