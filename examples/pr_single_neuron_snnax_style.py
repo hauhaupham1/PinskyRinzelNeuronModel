@@ -42,14 +42,14 @@ t0 = 0
 t1 = 100  # 100ms simulation
 dt0 = 1e-2
 s = 2
-sigma = jnp.array([[0, s, s, s, s, s, s, s],
-                   [0, s, s, s, s, s, s, s],
-                   [0, s, s, s, s, s, s, s],
-                   [0, s, s, s, s, s, s, s],
-                   [0, s, s, s, s, s, s, s],
-                   [0, s, s, s, s, s, s, s],
-                   [0, s, s, s, s, s, s, s],
-                   [0, s, s, s, s, s, s, s]])
+sigma = jnp.array([[0, 0, 0, 0, 0, 0, 0, 0],
+                   [s, s, s, s, s, s, s, s],
+                   [s, s, s, s, s, s, s, s],
+                   [s, s, s, s, s, s, s, s],
+                   [s, s, s, s, s, s, s, s],
+                   [s, s, s, s, s, s, s, s],
+                   [s, s, s, s, s, s, s, s],
+                   [s, s, s, s, s, s, s, s]])
 sample_sizes = [16, 32, 64, 128]
 c = 20.0  # input current amplitude (estimand)
 
