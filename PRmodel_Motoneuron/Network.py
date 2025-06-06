@@ -59,8 +59,8 @@ class MotoneuronNetwork(eqx.Module):
     f_Caconc: Float
     alpha_Caconc: Float
     kCa_Caconc: Float
-    sigma: Optional[Float[ArrayLike, "2 2"]]
-    diffusion_vf: Optional[Callable[..., Float[ArrayLike, "neurons 8 2 neurons"]]]
+    sigma: Optional[Float[ArrayLike, "8 8"]]
+    diffusion_vf: Optional[Callable[..., Float[ArrayLike, "neurons 8 8 neurons"]]]
     cond_fn: List[Callable[..., Float]]
     def __init__(
         self,
@@ -73,7 +73,7 @@ class MotoneuronNetwork(eqx.Module):
         wmin: Float = 0.0,
         wmax: Float = 0.5,
         diffusion: bool = False,
-        sigma: Optional[Float[ArrayLike, "7 7"]] = None,
+        sigma: Optional[Float[ArrayLike, "8 8"]] = None,
         key: Optional[Any] = None,
         **pr_params # Allows other PR params to be passed
     ):
@@ -262,14 +262,14 @@ class MotoneuronNetwork(eqx.Module):
         # Add optional diffusion term
         if diffusion:
             if sigma is None:
-                sigma = jr.normal(sigma_key, (7, 7))
+                sigma = jr.normal(sigma_key, (8, 8))
                 sigma = jnp.dot(sigma, sigma.T)
                 self.sigma = sigma
 
-            sigma_large = jnp.zeros((num_neurons, 8, 7, num_neurons))
-            #Add noise to all gate variables
+            sigma_large = jnp.zeros((num_neurons, 8, 8, num_neurons))
+            # #Add noise to all gate variables
             for k in range(num_neurons):
-                sigma_large = sigma_large.at[k, 1:, :, k].set(sigma)
+                sigma_large = sigma_large.at[k, :, :, k].set(sigma)
 
             def diffusion_vf(t, y, args):
                 return sigma_large
@@ -513,7 +513,7 @@ class MotoneuronNetwork(eqx.Module):
                 if self.diffusion_vf is not None:
                     # BrownianPath t0, t1 should span the entire simulation window of this __call__
                     bm = BrownianPath(
-                        t0_scalar -1, t1_scalar + 1, tol=dt0 / 2, shape=(7, self.num_neurons), key=_bm_key_seg 
+                        t0_scalar -1, t1_scalar + 1, tol=dt0 / 2, shape=(8, self.num_neurons), key=_bm_key_seg 
                     )
                     cvf = ControlTerm(self.diffusion_vf, bm)
                     multi_terms.append(cvf)
@@ -547,7 +547,7 @@ class MotoneuronNetwork(eqx.Module):
                     solver_state=_solver_state_seg,
                     controller_state=_controller_state_seg,
                     made_jump=_made_jump_seg,
-                    adjoint=RecursiveCheckpointAdjoint(checkpoints=1000)
+                    adjoint=RecursiveCheckpointAdjoint(checkpoints=10000)
                 )
                 # Process results
                 assert sol.event_mask is not None
