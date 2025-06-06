@@ -9,7 +9,7 @@ Credits:
 import functools as ft
 from typing import Any, Callable, List, Optional, Sequence
 import numpy as np
-from diffrax import ODETerm, ConstantStepSize, Event, Euler, Tsit5, SubSaveAt, SaveAt, ControlTerm, MultiTerm, diffeqsolve
+from diffrax import ODETerm, ConstantStepSize, Event, Euler, Tsit5, SubSaveAt, SaveAt, ControlTerm, MultiTerm, diffeqsolve, RecursiveCheckpointAdjoint
 import equinox as eqx
 import equinox.internal as eqxi
 import jax
@@ -131,35 +131,63 @@ class MotoneuronNetwork(eqx.Module):
         self.alpha_Caconc = 1.0  # Calcium dynamics parameter
         self.kCa_Caconc = 8.0  # Calcium dynamics parameter
 
+
+# safe helper function to avoid numerical issues with x / (exp(x) - 1)
+        def _safe_exp(x):
+            # Using Taylor expansion for x approx 0.
+            # As x -> 0, the function limit is 1.
+            # 1 - x/2 is the first-order approximation.
+            return jnp.where(jnp.abs(x) < 1e-6, 
+                             1.0 - x / 2.0,
+                             x / (jnp.exp(x) - 1.0))
+
         # Override with provided parameters from pr_params
         for param_key, value in pr_params.items():
             if hasattr(self, param_key):
                 setattr(self, param_key, value)
-        # Helper functions for Pinsky-Rinzel model
+
+        # Helper functions for Pinsky-Rinzel model (with stabilization)
         def alpha_m(V):
             V1 = V + 46.9
-            return -0.32 * V1 / (jnp.exp(-V1 / 4.) - 1.)
+            # Original: -0.32 * V1 / (exp(-V1 / 4) - 1)
+            # Corrected: 1.28 * _safe_exp(-V1 / 4.0)
+            return 1.28 * _safe_exp(-V1 / 4.0)
+
         def beta_m(V):
             V2 = V + 19.9
-            return 0.28 * V2 / (jnp.exp(V2 / 5.) - 1.)
+            # Original: 0.28 * V2 / (exp(V2 / 5) - 1)
+            # Corrected: 0.28 * 5 * _safe_exp(V2 / 5.0)
+            return 1.4 * _safe_exp(V2 / 5.0) # 0.28 * 5 = 1.4
+
         def m_inf(V):
             return alpha_m(V) / (alpha_m(V) + beta_m(V))
+
         def alpha_h(V):
             return 0.128 * jnp.exp((-43. - V) / 18.)
+
         def beta_h(V):
             V5 = V + 20.
             return 4. / (1 + jnp.exp(-V5 / 5.))
+
         def alpha_n(V):
             V3 = V + 24.9
-            return -0.016 * V3 / (jnp.exp(-V3 / 5.) - 1)
+            # Original: -0.016 * V3 / (exp(-V3 / 5) - 1)
+            # Corrected: 0.08 * _safe_exp(-V3 / 5.0)
+            return 0.08 * _safe_exp(-V3 / 5.0)
+
         def beta_n(V):
             V4 = V + 40.
             return 0.25 * jnp.exp(-V4 / 40.)
+
         def alpha_s(V):
             return 1.6 / (1 + jnp.exp(-0.072 * (V - 5.)))
+
         def beta_s(V):
             V6 = V + 8.9
-            return 0.02 * V6 / (jnp.exp(V6 / 5.) - 1.)
+            # Original: 0.02 * V6 / (exp(V6 / 5) - 1)
+            # Corrected: 0.02 * 5 * _safe_exp(V6 / 5.0)
+            return 0.1 * _safe_exp(V6 / 5.0) # 0.02 * 5 = 0.1
+
         def alpha_c(V):
             V7 = V + 53.5
             V8 = V + 50.
@@ -234,7 +262,7 @@ class MotoneuronNetwork(eqx.Module):
         # Add optional diffusion term
         if diffusion:
             if sigma is None:
-                sigma = jr.normal(sigma_key, (7, 7)) * 0.1
+                sigma = jr.normal(sigma_key, (7, 7))
                 sigma = jnp.dot(sigma, sigma.T)
                 self.sigma = sigma
 
@@ -519,6 +547,7 @@ class MotoneuronNetwork(eqx.Module):
                     solver_state=_solver_state_seg,
                     controller_state=_controller_state_seg,
                     made_jump=_made_jump_seg,
+                    adjoint=RecursiveCheckpointAdjoint(checkpoints=1000)
                 )
                 # Process results
                 assert sol.event_mask is not None
