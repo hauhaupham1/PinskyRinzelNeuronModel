@@ -45,6 +45,9 @@ class Head(eqx.Module):
 
 
 class MultiHeadAttention(eqx.Module):
+    heads : list
+    linear : eqx.nn.Linear
+    dropout : eqx.nn.Dropout
     
     def __init__(self, n_embed, num_heads, max_length = 100, dropout=0.2, key=None):
         if key is None:
