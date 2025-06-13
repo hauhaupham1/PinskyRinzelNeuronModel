@@ -9,7 +9,10 @@ import optax
 import time
 
 from transformer import Transformer
-from generate_training_data import generate_signature_sequence
+from losses import signature_mse_loss, hybrid_loss
+from marcus_lift_processing import lift_flatten_dimenstion, lift_unflatten, lift_flatten
+from generate_training_data_sig import generate_signature_sequence
+from generate_training_data_lift import generate_lift_sequence
 
 jax.config.update('jax_platform_name', 'cpu')
 jax.config.update('jax_enable_x64', True)
@@ -24,26 +27,27 @@ N_HEAD = 8
 N_LAYER = 6
 DROPOUT = 0.1
 
-def signature_mse_loss(pred_signatures, target_signatures):
-    """Simple MSE loss between predicted and target signatures."""
-    return jnp.mean((pred_signatures - target_signatures) ** 2)
 
 @eqx.filter_jit
-def compute_loss(model, sequences, targets):
+def compute_loss(model, sequences, targets, num_neurons=2):
     """Compute loss for a batch."""
     # Forward pass through transformer (handles batches directly)
-    predictions = model(sequences)  # (batch_size, seq_len, sig_dim)
+    predictions = model(sequences)  # (batch_size, seq_len, lift_dim)
     
     # Get the last time step prediction (next signature prediction)
-    last_predictions = predictions[:, -1, :]  # (batch_size, signature_dim)
+    last_predictions = predictions[:, -1, :]  # (batch_size, lift_dim)
+
+    #unflatten targets and predictions
+    unflatten_targets = jax.vmap(lift_unflatten, in_axes=(0, None))(targets, num_neurons)
+    unflatten_predictions = jax.vmap(lift_unflatten, in_axes=(0, None))(last_predictions, num_neurons)
     
     # Compute MSE loss
-    loss = signature_mse_loss(last_predictions, targets)
+    loss = hybrid_loss(unflatten_predictions, unflatten_targets)
     return loss
 
 @eqx.filter_jit
-def train_step(model, optimizer, opt_state, sequences, targets):
-    loss, grads = eqx.filter_value_and_grad(compute_loss)(model, sequences, targets)
+def train_step(model, optimizer, opt_state, sequences, targets, num_neurons=2):
+    loss, grads = eqx.filter_value_and_grad(compute_loss)(model, sequences, targets, num_neurons=num_neurons)
     updates, opt_state = optimizer.update(grads, opt_state, model)
     model = eqx.apply_updates(model, updates)
     return model, opt_state, loss
@@ -75,14 +79,27 @@ def train_transformer():
     key = jr.PRNGKey(42)
     model_key, data_key, train_key = jr.split(key, 3)
     num_neurons = 2
-    signature_depth = 3
     
     # Get signature dimension from a small test
-    signature_dim = calculate_signature_dim(num_neurons=num_neurons, signature_depth=signature_depth)
+    # signature_dim = calculate_signature_dim(num_neurons=num_neurons, signature_depth=signature_depth)
     
+    # Generate training data
+    print("Generating training data...")
+    sequences, targets = generate_lift_sequence(
+        num_simulations=500,
+        num_neurons=num_neurons,
+        window_size=10.0,
+        total_duration=100.0,
+        sequence_length=SEQUENCE_LENGTH,
+        key=data_key
+    )
+    #flatten sequences and targets
+    flatten_sequences = jax.vmap(jax.vmap(lift_flatten))(sequences)
+    flatten_targets = jax.vmap(lift_flatten)(targets)
     # Initialize transformer
+    in_dim = flatten_targets[0].size
     model = Transformer(
-        signature_dim=signature_dim,
+        in_dim=in_dim,
         n_embed=N_EMBED,
         n_head=N_HEAD, 
         n_layer=N_LAYER,
@@ -91,22 +108,10 @@ def train_transformer():
         key=model_key
     )
     
-    # Generate training data
-    print("Generating training data...")
-    sequences, targets = generate_signature_sequence(
-        num_simulations=500,
-        num_neurons=num_neurons,
-        signature_depth=signature_depth,
-        window_size=10.0,
-        total_duration=100.0,
-        sequence_length=SEQUENCE_LENGTH,
-        key=data_key
-    )
-    
     # Split train/validation
     n_train = int(0.8 * len(sequences))
-    train_sequences, val_sequences = sequences[:n_train], sequences[n_train:]
-    train_targets, val_targets = targets[:n_train], targets[n_train:]
+    train_sequences, val_sequences = flatten_sequences[:n_train], flatten_sequences[n_train:]
+    train_targets, val_targets = flatten_targets[:n_train], flatten_targets[n_train:]
     
     
     # Initialize optimizer
@@ -128,14 +133,14 @@ def train_transformer():
         epoch_losses = []
         for batch_seq, batch_targets in batches:
             model, opt_state, loss = train_step(
-                model, optimizer, opt_state, batch_seq, batch_targets
+                model, optimizer, opt_state, batch_seq, batch_targets, num_neurons=num_neurons
             )
             epoch_losses.append(loss)
         
         avg_train_loss = jnp.mean(jnp.array(epoch_losses))
         
         # Validation
-        val_loss = compute_loss(model, val_sequences, val_targets)
+        val_loss = compute_loss(model, val_sequences, val_targets, num_neurons=num_neurons)
         
         # Track best model
         if val_loss < best_val_loss:
@@ -144,7 +149,7 @@ def train_transformer():
         
         epoch_time = time.time() - epoch_start
         
-        if epoch % 10 == 0 or epoch == EPOCHS - 1:
+        if epoch % 1 == 0 or epoch == EPOCHS - 1:
             print(f"Epoch {epoch:3d}: train_loss={avg_train_loss:.6f}, "
                   f"val_loss={val_loss:.6f}, time={epoch_time:.2f}s")
     

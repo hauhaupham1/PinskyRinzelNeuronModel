@@ -117,34 +117,34 @@ class Block(eqx.Module):
 
 #Transformer model
 class Transformer(eqx.Module):
-    signature_embedding : eqx.nn.Linear
+    in_embedding : eqx.nn.Linear
     position_embedding : jnp.ndarray
     blocks : eqx.nn.Sequential
     ln_f : eqx.nn.LayerNorm
     output_embedding : eqx.nn.Linear
 
 
-    def __init__(self, signature_dim, n_embed, n_head, n_layer, max_length=100, dropout=0.2, key=None):
+    def __init__(self, in_dim, n_embed, n_head, n_layer, max_length=100, dropout=0.2, key=None):
         if key is None:
             key = jax.random.PRNGKey(0)
 
         keys = jax.random.split(key, 3+n_layer)
-        key_sig_embedding, key_output_embedding, key_position_embedding = keys[0], keys[1], keys[2]
+        key_in_embedding, key_output_embedding, key_position_embedding = keys[0], keys[1], keys[2]
         key_blocks = keys[3:]
 
         #input embedding
-        self.signature_embedding = eqx.nn.Linear(in_features=signature_dim, out_features=n_embed, use_bias=False, key=key_sig_embedding)
+        self.in_embedding = eqx.nn.Linear(in_features=in_dim, out_features=n_embed, use_bias=False, key=key_in_embedding)
         self.position_embedding = jax.random.normal(key=key_position_embedding, shape=(max_length, n_embed)) * 0.02
         self.blocks = eqx.nn.Sequential([Block(n_embed=n_embed, n_head=n_head, max_length=max_length, dropout=dropout, key=key_blocks[i]) for i in range(n_layer)])
         self.ln_f = eqx.nn.LayerNorm(shape=(n_embed,))
-        self.output_embedding = eqx.nn.Linear(in_features=n_embed, out_features=signature_dim, use_bias=False, key=key_output_embedding)
+        self.output_embedding = eqx.nn.Linear(in_features=n_embed, out_features=in_dim, use_bias=False, key=key_output_embedding)
 
     def __call__(self, x):
         B, T, _ = x.shape
         # Apply embedding
-        sig_embedding = jax.vmap(jax.vmap(self.signature_embedding))(x) 
+        in_embedding = jax.vmap(jax.vmap(self.in_embedding))(x) 
         pos_embedding = self.position_embedding[:T, :]
-        combined_embedding = sig_embedding + pos_embedding
+        combined_embedding = in_embedding + pos_embedding
         # Pass through transformer blocks
         combined_embedding = self.blocks(combined_embedding)
         # Final layer normalization
@@ -154,16 +154,16 @@ class Transformer(eqx.Module):
     
 
 # Example usage:
-transformer = Transformer(
-    signature_dim=39,  # From your 2-neuron, depth-3 signatures
-    n_embed=64,        # Model dimension
-    n_head=8,          # Number of attention heads  
-    n_layer=4,         # Number of transformer layers
-    max_length=50,     # Max sequence length
-    key=jax.random.PRNGKey(42)
-)
-# Test with dummy data
-batch_size, seq_len = 2, 10
-dummy_signatures = jax.random.normal(jax.random.PRNGKey(0), (batch_size, seq_len, 39))
-output = transformer(dummy_signatures)
-print(f"Output shape: {output.shape}")  # Should be (2, 10, 39)
+# transformer = Transformer(
+#     in_dim=60,  # From your 2-neuron, depth-3 signatures
+#     n_embed=64,        # Model dimension
+#     n_head=8,          # Number of attention heads  
+#     n_layer=4,         # Number of transformer layers
+#     max_length=50,     # Max sequence length
+#     key=jax.random.PRNGKey(42)
+# )
+# # Test with dummy data
+# batch_size, seq_len = 2, 10
+# dummy_signatures = jax.random.normal(jax.random.PRNGKey(0), (batch_size, seq_len, (60)))
+# output = transformer(dummy_signatures)
+# print(f"Output shape: {output.shape}")  # Should be (2, 10, 39)
