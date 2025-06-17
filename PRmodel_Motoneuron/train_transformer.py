@@ -115,6 +115,10 @@ def train_transformer():
     
     # Training loop
     best_val_loss = float('inf')
+
+    #save for plot
+    avg_train_losses = []
+    val_losses = []
     
     for epoch in range(EPOCHS):
         epoch_start = time.time()
@@ -147,6 +151,23 @@ def train_transformer():
         if epoch % 10 == 0 or epoch == EPOCHS - 1:
             print(f"Epoch {epoch:3d}: train_loss={avg_train_loss:.6f}, "
                   f"val_loss={val_loss:.6f}, time={epoch_time:.2f}s")
+            
+    
+        avg_train_losses.append(avg_train_loss)
+        val_losses.append(val_loss)
+
+    ##plot losses
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(10, 5))
+    plt.plot(avg_train_losses, label='Avg Train Loss', color='blue')
+    plt.plot(val_losses, label='Validation Loss', color='orange')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.title('Training and Validation Losses')
+    plt.legend()
+    plt.grid()
+    plt.savefig('training_marcus_losses.png')
+    plt.show()
     
     
     return best_model
