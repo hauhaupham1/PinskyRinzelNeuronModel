@@ -1,3 +1,7 @@
+#!/usr/bin/env python3
+# Author: Trung Le
+# Original file available at https://github.com/trungle93/STNDT
+# Adapted by Hau Pham
 import equinox as eqx
 import jax
 import jax.numpy as jnp
@@ -65,12 +69,12 @@ class TemporalHead(eqx.Module):
         if key is None:
             key = jr.PRNGKey(0)
     
-        key_k, key_q, key_v = jr.random.split(key, 3)
+        key_k, key_q, key_v = jr.split(key, 3)
 
         self.k = eqx.nn.Linear(in_features=n_embed, out_features=head_size, use_bias=False, key=key_k)
         self.q = eqx.nn.Linear(in_features=n_embed, out_features=head_size, use_bias=False, key=key_q)
         self.v = eqx.nn.Linear(in_features=n_embed, out_features=head_size, use_bias=False, key=key_v)
-        self.mask = mask = jnp.tril(jnp.ones((max_length, max_length)), dtype=jnp.float32)
+        self.mask = jnp.tril(jnp.ones((max_length, max_length), dtype=jnp.float32))
         self.dropout = eqx.nn.Dropout(dropout)
 
     def __call__(self, x, key=None):
@@ -100,17 +104,22 @@ class SpatialHead(eqx.Module):
         if key is None:
             key = jr.PRNGKey(1)
 
-        key_k, key_q = jr.random.split(key, 2)
+        key_k, key_q = jr.split(key, 2)
 
         self.k = eqx.nn.Linear(in_features=n_embed, out_features=head_size, use_bias=False, key=key_k)
         self.q = eqx.nn.Linear(in_features=n_embed, out_features=head_size, use_bias=False, key=key_q)
         self.dropout = eqx.nn.Dropout(dropout)
 
     def __call__(self, x, key=None):
-        k = jax.vmap(jax.vmap(self.k))(x) 
-        q = jax.vmap(jax.vmap(self.q))(x) 
-        scores = jnp.matmul(q, jnp.transpose(k, (0, 2, 1))) / jnp.sqrt(k.shape[-1])
+        # x has shape (B, N, T) where T is trial_length
+        # We want to produce attention weights of shape (B, N, N)
+        k = jax.vmap(jax.vmap(self.k))(x)  # (B, N, head_size)
+        q = jax.vmap(jax.vmap(self.q))(x)  # (B, N, head_size)
+        
+        # Compute attention scores over spatial dimension
+        scores = jnp.matmul(q, jnp.transpose(k, (0, 2, 1))) / jnp.sqrt(k.shape[-1])  # (B, N, N)
         scores = jax.nn.softmax(scores, axis=-1)
+        
         if key is not None:
             scores = self.dropout(scores, key=key)
         else:
@@ -151,13 +160,13 @@ class MultiheadTemporalAttention(eqx.Module):
 class MultiheadSpatialAttention(eqx.Module):
     heads: list
 
-    def __init__(self, n_embed, num_heads, dropout = 0.1, key = None):
+    def __init__(self, trial_length, num_heads, dropout = 0.1, key = None):
         if key is None:
             key= jr.PRNGKey(3)
 
         keys = jr.split(key, num_heads)
-        head_size = n_embed // num_heads
-        self.heads = [SpatialHead(n_embed=n_embed, head_size=head_size, dropout=dropout, key=keys[i]) for i in range(num_heads)]
+        head_size = trial_length // num_heads
+        self.heads = [SpatialHead(n_embed=trial_length, head_size=head_size, dropout=dropout, key=keys[i]) for i in range(num_heads)]
 
     def __call__(self, x, key=None):
         head_out = [head(x, key=key) for head in self.heads]
@@ -177,7 +186,7 @@ class FeedForward(eqx.Module):
         if key is None:
             key = jr.PRNGKey(4)
 
-        key1, key2 = jr.random.split(key)
+        key1, key2 = jr.split(key)
         self.linear1 = eqx.nn.Linear(in_features=n_embed, out_features=expansion_factor * n_embed, use_bias=True, key=key1)
         self.activation = eqx.nn.Lambda(jax.nn.relu)
         self.linear2 = eqx.nn.Linear(in_features=expansion_factor * n_embed, out_features=n_embed, use_bias=True, key=key2)
@@ -232,12 +241,13 @@ class STNDTEncoder(eqx.Module):
 
         keys = jr.split(key, 3)
         self.temporal_attention = MultiheadTemporalAttention(n_embed=n_embed, num_heads=num_heads, max_length=max_length, dropout=dropout, key=keys[0])
-        self.spatial_attention = MultiheadSpatialAttention(n_embed=n_embed, num_heads=num_heads, dropout=dropout, key=keys[1])
-        self.feed_forward_1 = FeedForward(n_embed=n_embed, dropout=dropout, key=keys[2])
-        self.feed_forward_2 = FeedForward(n_embed=n_embed, dropout=dropout, key=keys[2])
+        self.spatial_attention = MultiheadSpatialAttention(trial_length=max_length, num_heads=num_heads, dropout=dropout, key=keys[1])
+        key_ff1, key_ff2 = jr.split(keys[2], 2)
+        self.feed_forward_1 = FeedForward(n_embed=n_embed, dropout=dropout, key=key_ff1)
+        self.feed_forward_2 = FeedForward(n_embed=n_embed, dropout=dropout, key=key_ff2)
         self.t_ln1 = eqx.nn.LayerNorm(n_embed, eps=1e-6)
         self.t_ln2 = eqx.nn.LayerNorm(n_embed, eps=1e-6)
-        self.s_ln1 = eqx.nn.LayerNorm(n_embed, eps=1e-6)
+        self.s_ln1 = eqx.nn.LayerNorm(max_length, eps=1e-6)  # Normalize along T dimension for spatial
         self.fusion_ln = eqx.nn.LayerNorm(n_embed, eps=1e-6)
 
     def __call__(self, x_T, x_S, key = None):
@@ -256,7 +266,8 @@ class STNDTEncoder(eqx.Module):
         temporal_out = x + ff_out     #Z_T
 
         #Spatial attention
-        ln_x_S = self.s_ln1(x_S)
+        # x_S has shape (B, N, T), normalize along T dimension
+        ln_x_S = jax.vmap(jax.vmap(self.s_ln1))(x_S)
         spatial_weights = self.spatial_attention(ln_x_S, key=key_spatial)
 
         t_permuted = jnp.transpose(temporal_out, (0, 2, 1))  # (B, N, T)
@@ -511,7 +522,8 @@ class STNDT(eqx.Module):
         spatial_src = src.transpose(2, 0, 1)
         
         # Embed spatial features
-        spatial_src = jax.vmap(self.spatial_embedder)(spatial_src) * self.spatial_scale
+        # Note: spatial_embedder is identity when LINEAR_EMBEDDER=False and EMBED_DIM=0
+        spatial_src = spatial_src * self.spatial_scale
         key, subkey = jr.split(key)
         spatial_src = self.spatial_pos_encoder(spatial_src, key=subkey)
         
@@ -544,8 +556,8 @@ class STNDT(eqx.Module):
                 src = src.transpose(1, 0, 2)  # Back to (T, B, N)
             else:
                 # Subsequent layers: both inputs are (B, T, N) -> convert to expected format
-                src_for_layer = src.transpose(1, 0, 2)  # (B, T, N)
-                spatial_for_layer = src.transpose(2, 1, 0)  # (N, B, T) -> (B, N, T)
+                src_for_layer = src.transpose(1, 0, 2)  # (T, B, N) -> (B, T, N)
+                spatial_for_layer = src.transpose(1, 0, 2).transpose(0, 2, 1)  # (T, B, N) -> (B, T, N) -> (B, N, T)
                 src_out, spatial_weights = encoder(src_for_layer, spatial_for_layer, key=subkey)
                 src = src_out.transpose(1, 0, 2)  # Back to (T, B, N)
             
@@ -556,12 +568,17 @@ class STNDT(eqx.Module):
         
         # Apply final norm
         if self.norm is not None:
-            src = jax.vmap(self.norm)(src)
+            # src has shape (T, B, N), apply norm along N dimension
+            src = jax.vmap(jax.vmap(self.norm))(src)
         
         # Apply rate dropout and decoder
         key, subkey = jr.split(key)
-        encoder_output = self.rate_dropout(src, key=subkey if not val_phase else None)
-        decoder_output = jax.vmap(self.src_decoder)(encoder_output)
+        if val_phase:
+            encoder_output = self.rate_dropout(src, inference=True)
+        else:
+            encoder_output = self.rate_dropout(src, key=subkey)
+        # encoder_output has shape (T, B, N), apply decoder along last dimension
+        decoder_output = jax.vmap(jax.vmap(self.src_decoder))(encoder_output)
         
         # Compute decoder loss
         decoder_rates = decoder_output.transpose(1, 0, 2)  # (B, T, N)
@@ -582,10 +599,137 @@ class STNDT(eqx.Module):
         # Handle contrastive loss
         contrast_loss = jnp.array(0.0)
         if contrast_src1 is not None and contrast_src2 is not None:
-            # Process contrast sources through the model
-            # (Implementation would be similar to main forward pass)
-            # For brevity, returning placeholder
-            contrast_loss = jnp.array(0.0)
+            # Process first contrast source
+            spatial_contrast1 = contrast_src1.transpose(2, 0, 1) * self.spatial_scale
+            key, subkey = jr.split(key)
+            spatial_contrast1 = self.spatial_pos_encoder(spatial_contrast1, key=subkey)
+            
+            contrast_src1 = contrast_src1.transpose(1, 0, 2)
+            contrast_src1 = jax.vmap(self.embedder)(contrast_src1) * self.scale
+            key, subkey = jr.split(key)
+            contrast_src1_embedded = self.src_pos_encoder(contrast_src1, key=subkey)
+            
+            # Pass through encoder layers for contrast1
+            layer_outputs_contrast1 = []
+            src1 = contrast_src1_embedded
+            for i, encoder in enumerate(self.encoder_layers):
+                key, subkey = jr.split(key)
+                if i == 0:
+                    src1, _ = encoder(src1.transpose(1, 0, 2), 
+                                     spatial_contrast1.transpose(1, 0, 2), 
+                                     key=subkey)
+                    src1 = src1.transpose(1, 0, 2)
+                else:
+                    src1_for_layer = src1.transpose(1, 0, 2)
+                    spatial1_for_layer = src1.transpose(1, 0, 2).transpose(0, 2, 1)
+                    src1_out, _ = encoder(src1_for_layer, spatial1_for_layer, key=subkey)
+                    src1 = src1_out.transpose(1, 0, 2)
+                layer_outputs_contrast1.append(src1.transpose(1, 0, 2))
+            
+            if self.norm is not None:
+                src1 = jax.vmap(jax.vmap(self.norm))(src1)
+            
+            key, subkey = jr.split(key)
+            if val_phase:
+                encoder_output_contrast1 = self.rate_dropout(src1, inference=True)
+            else:
+                encoder_output_contrast1 = self.rate_dropout(src1, key=subkey)
+            decoder_output_contrast1 = jax.vmap(jax.vmap(self.src_decoder))(encoder_output_contrast1)
+            
+            # Process second contrast source
+            spatial_contrast2 = contrast_src2.transpose(2, 0, 1) * self.spatial_scale
+            key, subkey = jr.split(key)
+            spatial_contrast2 = self.spatial_pos_encoder(spatial_contrast2, key=subkey)
+            
+            contrast_src2 = contrast_src2.transpose(1, 0, 2)
+            contrast_src2 = jax.vmap(self.embedder)(contrast_src2) * self.scale
+            key, subkey = jr.split(key)
+            contrast_src2_embedded = self.src_pos_encoder(contrast_src2, key=subkey)
+            
+            # Pass through encoder layers for contrast2
+            layer_outputs_contrast2 = []
+            src2 = contrast_src2_embedded
+            for i, encoder in enumerate(self.encoder_layers):
+                key, subkey = jr.split(key)
+                if i == 0:
+                    src2, _ = encoder(src2.transpose(1, 0, 2), 
+                                     spatial_contrast2.transpose(1, 0, 2), 
+                                     key=subkey)
+                    src2 = src2.transpose(1, 0, 2)
+                else:
+                    src2_for_layer = src2.transpose(1, 0, 2)
+                    spatial2_for_layer = src2.transpose(1, 0, 2).transpose(0, 2, 1)
+                    src2_out, _ = encoder(src2_for_layer, spatial2_for_layer, key=subkey)
+                    src2 = src2_out.transpose(1, 0, 2)
+                layer_outputs_contrast2.append(src2.transpose(1, 0, 2))
+            
+            if self.norm is not None:
+                src2 = jax.vmap(jax.vmap(self.norm))(src2)
+                
+            key, subkey = jr.split(key)
+            if val_phase:
+                encoder_output_contrast2 = self.rate_dropout(src2, inference=True)
+            else:
+                encoder_output_contrast2 = self.rate_dropout(src2, key=subkey)
+            decoder_output_contrast2 = jax.vmap(jax.vmap(self.src_decoder))(encoder_output_contrast2)
+            
+            # Select which layer to use for contrastive loss
+            contrast_layer = self.config.get('CONTRAST_LAYER', 'decoder')
+            if contrast_layer == 'embedder':
+                out1 = contrast_src1_embedded.transpose(1, 0, 2)  # (B, T, N)
+                out2 = contrast_src2_embedded.transpose(1, 0, 2)
+            elif contrast_layer == 'decoder':
+                out1 = decoder_output_contrast1.transpose(1, 0, 2)  # (B, T, N)
+                out2 = decoder_output_contrast2.transpose(1, 0, 2)
+            else:
+                # Use specific encoder layer output
+                layer_idx = int(contrast_layer) if isinstance(contrast_layer, (int, str)) and str(contrast_layer).isdigit() else -1
+                out1 = layer_outputs_contrast1[layer_idx]
+                out2 = layer_outputs_contrast2[layer_idx]
+            
+            # Apply projector and flatten
+            out1 = jax.vmap(jax.vmap(self.projector))(out1)  # (B, T, N)
+            out2 = jax.vmap(jax.vmap(self.projector))(out2)  # (B, T, N)
+            out1 = out1.reshape(out1.shape[0], -1)  # (B, T*N)
+            out2 = out2.reshape(out2.shape[0], -1)  # (B, T*N)
+            
+            # Concatenate features from both views
+            features = jnp.concatenate([out1, out2], axis=0)  # (2*B, T*N)
+            
+            # Compute InfoNCE loss
+            logits, labels = self.info_nce_loss(features)
+            
+            # Cross entropy loss
+            log_probs = jax.nn.log_softmax(logits, axis=1)
+            ce_loss = -log_probs[jnp.arange(logits.shape[0]), labels]
+            
+            if not val_phase:
+                contrast_loss = jnp.mean(ce_loss) * self.contrast_lambda
+            else:
+                contrast_loss = ce_loss * self.contrast_lambda
+                
+            # If using embedder layer, also compute spatial contrastive loss
+            if contrast_layer == 'embedder' and self.config.get('USE_SPATIAL_CONTRAST', True):
+                # Use spatial embeddings
+                spatial_embed1 = spatial_contrast1.transpose(1, 0, 2)  # (B, N, T)
+                spatial_embed2 = spatial_contrast2.transpose(1, 0, 2)
+                
+                spatial_out1 = jax.vmap(jax.vmap(self.spatial_projector))(spatial_embed1)
+                spatial_out2 = jax.vmap(jax.vmap(self.spatial_projector))(spatial_embed2)
+                spatial_out1 = spatial_out1.reshape(spatial_out1.shape[0], -1)
+                spatial_out2 = spatial_out2.reshape(spatial_out2.shape[0], -1)
+                
+                # Compute spatial contrastive loss
+                spatial_features = jnp.concatenate([spatial_out1, spatial_out2], axis=0)
+                spatial_logits, spatial_labels = self.info_nce_loss(spatial_features)
+                
+                spatial_log_probs = jax.nn.log_softmax(spatial_logits, axis=1)
+                spatial_ce_loss = -spatial_log_probs[jnp.arange(spatial_logits.shape[0]), spatial_labels]
+                
+                if not val_phase:
+                    contrast_loss = contrast_loss + jnp.mean(spatial_ce_loss) * self.contrast_lambda
+                else:
+                    contrast_loss = contrast_loss + spatial_ce_loss * self.contrast_lambda
         
         # Aggregate losses
         if not val_phase:
