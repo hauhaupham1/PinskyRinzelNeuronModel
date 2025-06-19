@@ -236,15 +236,19 @@ class STNDTEncoder(eqx.Module):
         self.ts_dropout3 = eqx.nn.Dropout(dropout)
         self.spatial_norm_1 = eqx.nn.LayerNorm(max_length)
 
-    def __call__(self, src, spatial_src, src_mask=None, key=None, prenorm=False):
+    def __call__(self, src, spatial_src, src_mask=None, key=None, prenorm=True):
         if key is None:
             key = jr.PRNGKey(6)
+        
+        # Split keys properly for all dropout operations
+        keys = jr.split(key, 8)  # Need 8 different keys
+        key_t, key_drop_1, key_drop_ff1, key_drop_ff2, key_spatial, key_ts_drop1, key_ts_drop2, key_ts_drop3 = keys
+        
         residual = src
         if prenorm:
             src = jax.vmap(jax.vmap(self.norm1))(src)
 
         # Apply temporal attention
-        key_t, key_drop_1 = jr.split(key)
         t_out = self.temporal_attention(src, src_mask=src_mask, key=key_t)
         src = residual + (self.dropout1(t_out, key=key_drop_1) if key is not None else self.dropout1(t_out, inference=True))
 
@@ -256,10 +260,10 @@ class STNDTEncoder(eqx.Module):
         
         src2 = jax.vmap(jax.vmap(self.linear1))(src)
         src2 = jax.vmap(jax.vmap(self.activation))(src2)
-        src2 = self.dropout(src2, key=key) if key is not None else self.dropout(src2, inference=True)
+        src2 = self.dropout(src2, key=key_drop_ff1) if key is not None else self.dropout(src2, inference=True)
         src2 = jax.vmap(jax.vmap(self.linear2))(src2)
         
-        src = residual + (self.dropout(src2, key=key) if key is not None else self.dropout(src2, inference=True))
+        src = residual + (self.dropout(src2, key=key_drop_ff2) if key is not None else self.dropout(src2, inference=True))
 
         if not prenorm:
             src = jax.vmap(jax.vmap(self.norm2))(src)
@@ -267,14 +271,14 @@ class STNDTEncoder(eqx.Module):
         spatial_residual = spatial_src
         if prenorm:
             spatial_src = jax.vmap(jax.vmap(self.spatial_norm_1))(spatial_src)
-        spatial_weights = self.spatial_attention(spatial_src, key=key)
+        spatial_weights = self.spatial_attention(spatial_src, key=key_spatial)
 
         ts_residual = src
         if prenorm:
             src = jax.vmap(jax.vmap(self.ts_norm1))(src)
         
         ts_out = jnp.matmul(spatial_weights, src.transpose(0, 2, 1)).transpose(0, 2, 1)  # (B, T, N)
-        ts_out = ts_residual + (self.ts_dropout1(ts_out, key=key) if key is not None else self.ts_dropout1(ts_out, inference=True))
+        ts_out = ts_residual + (self.ts_dropout1(ts_out, key=key_ts_drop1) if key is not None else self.ts_dropout1(ts_out, inference=True))
         if not prenorm:
             ts_out = jax.vmap(jax.vmap(self.ts_norm1))(ts_out)
 
@@ -284,11 +288,10 @@ class STNDTEncoder(eqx.Module):
 
         ts_out = jax.vmap(jax.vmap(self.ts_linear1))(ts_out)
         ts_out = jax.vmap(jax.vmap(self.activation))(ts_out)
-        ts_out = self.ts_dropout2(ts_out, key=key) if key is not None else self.ts_dropout2(ts_out, inference=True)
+        ts_out = self.ts_dropout2(ts_out, key=key_ts_drop2) if key is not None else self.ts_dropout2(ts_out, inference=True)
         ts_out = jax.vmap(jax.vmap(self.ts_linear2))(ts_out)
 
-
-        ts_out = ts_residual + (self.ts_dropout3(ts_out, key=key) if key is not None else self.ts_dropout3(ts_out, inference=True))
+        ts_out = ts_residual + (self.ts_dropout3(ts_out, key=key_ts_drop3) if key is not None else self.ts_dropout3(ts_out, inference=True))
         if not prenorm:
             ts_out = jax.vmap(jax.vmap(self.ts_norm2))(ts_out)
 
@@ -320,13 +323,6 @@ class STNDT(eqx.Module):
     norm: Optional[eqx.Module]
     projector: eqx.Module
     spatial_projector: eqx.Module
-    # Manual projector components (when LINEAR_PROJECTOR=False)
-    projector_linear1: eqx.Module
-    projector_activation: eqx.Module
-    projector_linear2: eqx.Module
-    spatial_projector_linear1: eqx.Module
-    spatial_projector_activation: eqx.Module
-    spatial_projector_linear2: eqx.Module
     # Decoder components defined below
     rate_dropout: eqx.nn.Dropout
     
@@ -440,37 +436,24 @@ class STNDT(eqx.Module):
             if config.get('LINEAR_PROJECTOR', False):
                 self.projector = eqx.nn.Linear(num_neurons, num_neurons, key=key1)
                 self.spatial_projector = eqx.nn.Linear(trial_length, trial_length, key=key2)
-                # Set manual projector components to Identity
-                self.projector_linear1 = eqx.nn.Identity()
-                self.projector_activation = eqx.nn.Identity()
-                self.projector_linear2 = eqx.nn.Identity()
-                self.spatial_projector_linear1 = eqx.nn.Identity()
-                self.spatial_projector_activation = eqx.nn.Identity()
-                self.spatial_projector_linear2 = eqx.nn.Identity()
             else:
                 key1_split1, key1_split2 = jr.split(key1)
                 key2_split1, key2_split2 = jr.split(key2)
-                # Manual projector layers (avoid Sequential key issues)
-                self.projector_linear1 = eqx.nn.Linear(num_neurons, 1024, key=key1_split1)
-                self.projector_activation = eqx.nn.PReLU(init_alpha=0.01)
-                self.projector_linear2 = eqx.nn.Linear(1024, num_neurons, key=key1_split2)
+                # Use Sequential with PReLU wrapped in Lambda to handle key passing
+                self.projector = eqx.nn.Sequential([
+                    eqx.nn.Linear(num_neurons, 1024, key=key1_split1),
+                    eqx.nn.Lambda(eqx.nn.PReLU(init_alpha=0.01)),
+                    eqx.nn.Linear(1024, num_neurons, key=key1_split2)
+                ])
                 
-                self.spatial_projector_linear1 = eqx.nn.Linear(trial_length, 1024, key=key2_split1)
-                self.spatial_projector_activation = eqx.nn.PReLU(init_alpha=0.01)
-                self.spatial_projector_linear2 = eqx.nn.Linear(1024, trial_length, key=key2_split2)
-                # Set simple projectors to Identity
-                self.projector = eqx.nn.Identity()
-                self.spatial_projector = eqx.nn.Identity()
+                self.spatial_projector = eqx.nn.Sequential([
+                    eqx.nn.Linear(trial_length, 1024, key=key2_split1),
+                    eqx.nn.Lambda(eqx.nn.PReLU(init_alpha=0.01)),
+                    eqx.nn.Linear(1024, trial_length, key=key2_split2)
+                ])
         else:
             self.projector = eqx.nn.Identity()
             self.spatial_projector = eqx.nn.Identity()
-            # Set manual projector components to Identity
-            self.projector_linear1 = eqx.nn.Identity()
-            self.projector_activation = eqx.nn.Identity()
-            self.projector_linear2 = eqx.nn.Identity()
-            self.spatial_projector_linear1 = eqx.nn.Identity()
-            self.spatial_projector_activation = eqx.nn.Identity()
-            self.spatial_projector_linear2 = eqx.nn.Identity()
         
         # Rate dropout
         self.rate_dropout = eqx.nn.Dropout(config.get('DROPOUT_RATES', 0.0))
@@ -543,31 +526,6 @@ class STNDT(eqx.Module):
         x = self.final_activation(x)    # Either PReLU or Identity
         return x
     
-    def apply_projector(self, x):
-        """Apply projector layers manually"""
-        if not isinstance(self.projector, eqx.nn.Identity):
-            return self.projector(x)
-        elif not isinstance(self.projector_linear1, eqx.nn.Identity):
-            # Manual 3-layer projector
-            x = self.projector_linear1(x)
-            x = self.projector_activation(x)
-            x = self.projector_linear2(x)
-            return x
-        else:
-            return x  # Identity
-    
-    def apply_spatial_projector(self, x):
-        """Apply spatial projector layers manually"""
-        if not isinstance(self.spatial_projector, eqx.nn.Identity):
-            return self.spatial_projector(x)
-        elif not isinstance(self.spatial_projector_linear1, eqx.nn.Identity):
-            # Manual 3-layer spatial projector
-            x = self.spatial_projector_linear1(x)
-            x = self.spatial_projector_activation(x)
-            x = self.spatial_projector_linear2(x)
-            return x
-        else:
-            return x  # Identity
     
     def info_nce_loss(self, features: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
         """
@@ -805,8 +763,8 @@ class STNDT(eqx.Module):
                 out2 = layer_outputs_contrast2[layer_idx]
             
             # Apply projector and flatten
-            out1 = jax.vmap(jax.vmap(self.apply_projector))(out1)  # (B, T, N)
-            out2 = jax.vmap(jax.vmap(self.apply_projector))(out2)  # (B, T, N)
+            out1 = jax.vmap(jax.vmap(self.projector))(out1)  # (B, T, N)
+            out2 = jax.vmap(jax.vmap(self.projector))(out2)  # (B, T, N)
             out1 = out1.reshape(out1.shape[0], -1)  # (B, T*N)
             out2 = out2.reshape(out2.shape[0], -1)  # (B, T*N)
             
@@ -831,8 +789,9 @@ class STNDT(eqx.Module):
                 spatial_embed1 = spatial_contrast1.transpose(1, 0, 2)  # (B, N, T)
                 spatial_embed2 = spatial_contrast2.transpose(1, 0, 2)
                 
-                spatial_out1 = jax.vmap(jax.vmap(self.apply_spatial_projector))(spatial_embed1)
-                spatial_out2 = jax.vmap(jax.vmap(self.apply_spatial_projector))(spatial_embed2)
+                # Apply spatial projector
+                spatial_out1 = jax.vmap(jax.vmap(self.spatial_projector))(spatial_embed1)
+                spatial_out2 = jax.vmap(jax.vmap(self.spatial_projector))(spatial_embed2)
                 spatial_out1 = spatial_out1.reshape(spatial_out1.shape[0], -1)
                 spatial_out2 = spatial_out2.reshape(spatial_out2.shape[0], -1)
                 
