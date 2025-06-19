@@ -184,14 +184,20 @@ class FeedForward(eqx.Module):
     dropout: eqx.nn.Dropout
 
 
-    def __init__(self, n_embed, dropout=0.1, expansion_factor = 4, key = None):
+    def __init__(self, n_embed, dropout=0.1, expansion_factor = 4, hidden_size=None, key = None):
         if key is None:
             key = jr.PRNGKey(4)
 
         key1, key2 = jr.split(key)
-        self.linear1 = eqx.nn.Linear(in_features=n_embed, out_features=expansion_factor * n_embed, use_bias=True, key=key1)
+        # If hidden_size is provided, use it directly. Otherwise use expansion_factor
+        if hidden_size is not None:
+            hidden_dim = hidden_size
+        else:
+            hidden_dim = expansion_factor * n_embed
+            
+        self.linear1 = eqx.nn.Linear(in_features=n_embed, out_features=hidden_dim, use_bias=True, key=key1)
         self.activation = eqx.nn.PReLU(init_alpha=0.01)
-        self.linear2 = eqx.nn.Linear(in_features=expansion_factor * n_embed, out_features=n_embed, use_bias=True, key=key2)
+        self.linear2 = eqx.nn.Linear(in_features=hidden_dim, out_features=n_embed, use_bias=True, key=key2)
         self.dropout = eqx.nn.Dropout(dropout)
 
     def __call__(self, x, key=None):
@@ -237,7 +243,7 @@ class STNDTEncoder(eqx.Module):
     s_ln1: eqx.nn.LayerNorm
     fusion_ln: eqx.nn.LayerNorm
 
-    def __init__(self, n_embed, num_heads, max_length=100, dropout=0.1, key=None):
+    def __init__(self, n_embed, num_heads, max_length=100, dropout=0.1, hidden_size=None, key=None):
         if key is None:
             key = jr.PRNGKey(5)
 
@@ -245,8 +251,8 @@ class STNDTEncoder(eqx.Module):
         self.temporal_attention = MultiheadTemporalAttention(n_embed=n_embed, num_heads=num_heads, max_length=max_length, dropout=dropout, key=keys[0])
         self.spatial_attention = MultiheadSpatialAttention(trial_length=max_length, num_heads=num_heads, dropout=dropout, key=keys[1])
         key_ff1, key_ff2 = jr.split(keys[2], 2)
-        self.feed_forward_1 = FeedForward(n_embed=n_embed, dropout=dropout, key=key_ff1)
-        self.feed_forward_2 = FeedForward(n_embed=n_embed, dropout=dropout, key=key_ff2)
+        self.feed_forward_1 = FeedForward(n_embed=n_embed, dropout=dropout, hidden_size=hidden_size, key=key_ff1)
+        self.feed_forward_2 = FeedForward(n_embed=n_embed, dropout=dropout, hidden_size=hidden_size, key=key_ff2)
         self.t_ln1 = eqx.nn.LayerNorm(n_embed, eps=1e-6)
         self.t_ln2 = eqx.nn.LayerNorm(n_embed, eps=1e-6)
         self.s_ln1 = eqx.nn.LayerNorm(max_length, eps=1e-6)  # Normalize along T dimension for spatial
@@ -414,6 +420,7 @@ class STNDT(eqx.Module):
                 num_heads=num_heads,
                 max_length=trial_length,
                 dropout=dropout,
+                hidden_size=config.get('HIDDEN_SIZE', None),  # Pass hidden_size 
                 key=keys[i]
             )
             for i in range(num_layers)
