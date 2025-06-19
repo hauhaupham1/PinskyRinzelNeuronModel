@@ -321,9 +321,8 @@ class STNDT(eqx.Module):
     spatial_pos_encoder: PositionalEncoding
     encoder_layers: list
     norm: Optional[eqx.Module]
-    projector: eqx.Module
-    spatial_projector: eqx.Module
-    # Decoder components defined below
+    projector: eqx.nn.Sequential
+    spatial_projector: eqx.nn.Sequential
     rate_dropout: eqx.nn.Dropout
     
     # Model parameters
@@ -336,13 +335,8 @@ class STNDT(eqx.Module):
     contrast_lambda: float
     max_spikes: int
     
-    # Decoder components (all trainable, matching PyTorch)
-    decoder_layers_count: int = eqx.static_field()
-    use_lograte: bool = eqx.static_field()
-    decoder_linear: eqx.nn.Linear
-    decoder_activation: eqx.Module  # Either PReLU or Identity
-    decoder_linear2: eqx.Module     # Either Linear or Identity
-    final_activation: eqx.Module    # Either PReLU or Identity
+    # Decoder (using Sequential)
+    decoder: eqx.nn.Sequential
     
     # Configuration (static, not trainable)
     config: Dict[str, Any] = eqx.static_field()
@@ -462,34 +456,36 @@ class STNDT(eqx.Module):
         key1, key2, key = jr.split(key, 3)
         initrange = config.get('INIT_RANGE', 0.1)
         if config.get('LOSS', {}).get('TYPE') == "poisson":
-            self.decoder_layers_count = config.get('DECODER', {}).get('LAYERS', 1)
-            self.use_lograte = config.get('LOGRATE', False)
+            decoder_layers = []
             
-            if self.decoder_layers_count == 1:
-                temp_decoder_linear = eqx.nn.Linear(num_neurons, num_neurons, key=key1)
-                temp_decoder_activation = eqx.nn.Identity()
-                temp_decoder_linear2 = eqx.nn.Identity()
+            if config.get('DECODER', {}).get('LAYERS', 1) == 1:
+                # Single layer decoder with custom initialization
+                temp_linear = eqx.nn.Linear(num_neurons, num_neurons, key=key1)
+                key, weight_key = jr.split(key, 2)
+                weights = jr.uniform(weight_key, temp_linear.weight.shape, minval=-initrange, maxval=initrange)
+                bias = jnp.zeros_like(temp_linear.bias)
+                first_linear = eqx.tree_at(lambda layer: (layer.weight, layer.bias),
+                                          temp_linear, (weights, bias))
+                decoder_layers.append(first_linear)
             else:
-                temp_decoder_linear = eqx.nn.Linear(num_neurons, 16, key=key1)
-                temp_decoder_activation = eqx.nn.PReLU(init_alpha=0.01)
-                temp_decoder_linear2 = eqx.nn.Linear(16, num_neurons, key=key2)
-
-            key, weight_key = jr.split(key, 2)
-            weights = jr.uniform(weight_key, temp_decoder_linear.weight.shape, minval=-initrange, maxval=initrange)
-            bias = jnp.zeros_like(temp_decoder_linear.bias)
-
-            final_decoder_linear = eqx.tree_at(lambda layer: (layer.weight, layer.bias),
-                                                temp_decoder_linear, (weights, bias))
+                # Two layer decoder with custom initialization for first layer
+                temp_linear = eqx.nn.Linear(num_neurons, 16, key=key1)
+                key, weight_key = jr.split(key, 2)
+                weights = jr.uniform(weight_key, temp_linear.weight.shape, minval=-initrange, maxval=initrange)
+                bias = jnp.zeros_like(temp_linear.bias)
+                first_linear = eqx.tree_at(lambda layer: (layer.weight, layer.bias),
+                                          temp_linear, (weights, bias))
+                decoder_layers.extend([
+                    first_linear,
+                    eqx.nn.Lambda(eqx.nn.PReLU(init_alpha=0.01)),
+                    eqx.nn.Linear(16, num_neurons, key=key2)
+                ])
             
-            self.decoder_linear = final_decoder_linear
-            self.decoder_activation = temp_decoder_activation
-            self.decoder_linear2 = temp_decoder_linear2
+            # Add final activation if not using lograte
+            if not config.get('LOGRATE', False):
+                decoder_layers.append(eqx.nn.Lambda(jax.nn.softplus))
             
-            if not self.use_lograte:
-                # self.final_activation = eqx.nn.PReLU(init_alpha=0.01)
-                self.final_activation = eqx.nn.Lambda(jax.nn.softplus)
-            else:
-                self.final_activation = eqx.nn.Identity()
+            self.decoder = eqx.nn.Sequential(decoder_layers)
     
     def _generate_context_mask(self, size: int, context_forward: int = -1, 
                              context_backward: int = 0, expose_ic: bool = True) -> jnp.ndarray:
@@ -518,13 +514,6 @@ class STNDT(eqx.Module):
         # Convert binary mask to attention mask (False -> -inf, True -> 0)
         return jnp.where(mask, 0.0, -jnp.inf)
     
-    def apply_decoder(self, x):
-        """Apply decoder layers manually"""
-        x = self.decoder_linear(x)
-        x = self.decoder_activation(x)  # Either PReLU or Identity
-        x = self.decoder_linear2(x)     # Either Linear or Identity  
-        x = self.final_activation(x)    # Either PReLU or Identity
-        return x
     
     
     def info_nce_loss(self, features: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
@@ -649,7 +638,7 @@ class STNDT(eqx.Module):
         else:
             encoder_output = self.rate_dropout(src, key=subkey)
         # encoder_output has shape (T, B, N), apply decoder along last dimension
-        decoder_output = jax.vmap(jax.vmap(self.apply_decoder))(encoder_output)
+        decoder_output = jax.vmap(jax.vmap(self.decoder))(encoder_output)
         
         # Compute decoder loss
         decoder_rates = decoder_output.transpose(1, 0, 2)  # (B, T, N)
@@ -707,7 +696,7 @@ class STNDT(eqx.Module):
                 encoder_output_contrast1 = self.rate_dropout(src1, inference=True)
             else:
                 encoder_output_contrast1 = self.rate_dropout(src1, key=subkey)
-            decoder_output_contrast1 = jax.vmap(jax.vmap(self.apply_decoder))(encoder_output_contrast1)
+            decoder_output_contrast1 = jax.vmap(jax.vmap(self.decoder))(encoder_output_contrast1)
             
             # Process second contrast source
             spatial_contrast2 = contrast_src2.transpose(2, 0, 1) * self.spatial_scale
@@ -746,7 +735,7 @@ class STNDT(eqx.Module):
                 encoder_output_contrast2 = self.rate_dropout(src2, inference=True)
             else:
                 encoder_output_contrast2 = self.rate_dropout(src2, key=subkey)
-            decoder_output_contrast2 = jax.vmap(jax.vmap(self.apply_decoder))(encoder_output_contrast2)
+            decoder_output_contrast2 = jax.vmap(jax.vmap(self.decoder))(encoder_output_contrast2)
             
             # Select which layer to use for contrastive loss
             contrast_layer = self.config.get('CONTRAST_LAYER', 'decoder')
