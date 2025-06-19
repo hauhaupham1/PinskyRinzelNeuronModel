@@ -77,21 +77,40 @@ def create_config():
         'MASK_MODE': 'timestep',
         'MASK_RATIO': 0.15,
         'MASK_MAX_SPAN': 3,
+        
+        # Contrastive masking config
+        'CONTRAST_MASK_MODE': 'timestep',
+        'CONTRAST_MASK_RATIO': 0.2,
+        'CONTRAST_MASK_MAX_SPAN': 3,
+        'USE_CONTRAST_PROJECTOR': True,
+        'LINEAR_PROJECTOR': False,
+        'CONTRAST_LAYER': 'decoder',
+        'TEMPERATURE': 0.5,
+        'LAMBDA': 1.0,
 
         #TRAINING PARAMETERS
         'BATCH_SIZE': 32,
-        'NUM_UPDATES': 500,
+        'NUM_UPDATES': 1000,
         'LR' :{
-            'INIT': 1e-3,
-            'SCHEDULE': False,
+            'INIT': 1e-4,
+            'SCHEDULE': True,
+            'SCHEDULER': 'cosine',
+            'WARMUP': 100,
         },
+        'MAX_GRAD_NORM': 200.0,
         'LOSS': {
             'TYPE': 'poisson',
         },
-        'LOGRATE': False
+        'LOGRATE': False,
+        
+        # Context masking settings
+        'FULL_CONTEXT': False,          # If True, no context masking (attend to all positions)
+        'CONTEXT_FORWARD': 0,          # How many positions forward to attend (-1 = unlimited)
+        'CONTEXT_BACKWARD': -1,         # How many positions backward to attend
+        'CONTEXT_WRAP_INITIAL': False   # Whether to wrap initial context
     }
 
-
+@eqx.filter_jit
 def train_step_filtered(params, static, optimizer, opt_state, batch, masker, key):
     """Single training step with parameter filtering"""
     
@@ -99,10 +118,16 @@ def train_step_filtered(params, static, optimizer, opt_state, batch, masker, key
         # Combine params and static parts to reconstruct model
         model = eqx.combine(params, static)
         
-        key1, key2 = jr.split(key)
+        key1, key2, key3 = jr.split(key, 3)
         masked_batch, mask_labels, _, _, _, _ = masker.mask_batch(batch=batch, key=key1)
+        
+        # Create contrastive views
+        from mask import create_contrastive_masks
+        contrast_src1, _, contrast_src2, _ = create_contrastive_masks(batch, model.config, key=key2)
 
-        outputs = model(src=masked_batch, mask_labels=mask_labels, val_phase=False, key=key2)
+        outputs = model(src=masked_batch, mask_labels=mask_labels, 
+                       contrast_src1=contrast_src1, contrast_src2=contrast_src2, 
+                       val_phase=False, key=key3)
 
         loss, decoder_loss, contrast_loss, _ = outputs
 
@@ -117,11 +142,21 @@ def train_step_filtered(params, static, optimizer, opt_state, batch, masker, key
     
     return params, opt_state, loss, decoder_loss, contrast_loss
 
+@eqx.filter_jit
+def validation_step(model: STNDT, batch: jnp.ndarray, masker: JAXMasker, key):
+    """Performs one validation step."""
+    key1, key2 = jr.split(key)
+    masked_batch, mask_labels, _, _, _, _ = masker.mask_batch(batch=batch, key=key1)
+    outputs = model(src=masked_batch, mask_labels=mask_labels, val_phase=True, key=key2)
+    per_sample_loss = outputs[0] 
+    return per_sample_loss.mean()
+
 def main():
 
     sol = simulation_data(num_neurons=num_neurons, duration=100.0)
 
     spike_data = create_data(sol, duration=100.0, bin_size=1.0)
+    spike_data = jnp.clip(spike_data, 0, int(jnp.max(spike_data)))
 
     train_size = int(0.8 * num_samples)
     train_data = spike_data[:train_size]
@@ -138,12 +173,24 @@ def main():
                   max_spikes=int(jnp.max(spike_data)),
                   key=model_key)
     
-    optimizer = optax.adam(learning_rate=config['LR']['INIT'])
+    schedule = optax.warmup_cosine_decay_schedule(
+        init_value=0.0,
+        peak_value=config['LR']['INIT'],
+        warmup_steps=config['LR']['WARMUP'],
+        decay_steps=config['NUM_UPDATES']
+    )
+    
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(config['MAX_GRAD_NORM']),  # Gradient clipping
+        optax.adam(learning_rate=schedule, eps=1e-8)  # Adam with warmup schedule
+    )
     # Partition model into trainable and static parts
     params, static = eqx.partition(model, eqx.is_inexact_array)
     opt_state = optimizer.init(params)
     masker = JAXMasker(config)
     batch_size = config['BATCH_SIZE']
+
+
 
     for step in range(config['NUM_UPDATES']):
         key, batch_key = jr.split(key)
@@ -163,10 +210,8 @@ def main():
             
             # Run validation (no gradient computation)
             model = eqx.combine(params, static)  # Reconstruct model for validation
-            key1, key2 = jr.split(val_key)
-            masked_val_batch, val_mask_labels, _, _, _, _ = masker.mask_batch(batch=val_batch, key=key1)
-            val_outputs = model(src=masked_val_batch, mask_labels=val_mask_labels, val_phase=True, key=key2)
-            val_loss = val_outputs[0].mean()
+            
+            val_loss = validation_step(model, val_batch, masker, val_key)
             
             print(f"         >>> VALIDATION: Loss={val_loss:.4f} <<<")
             print()
