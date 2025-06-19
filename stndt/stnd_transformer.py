@@ -274,7 +274,7 @@ class STNDTEncoder(eqx.Module):
             src = jax.vmap(jax.vmap(self.ts_norm1))(src)
         
         ts_out = jnp.matmul(spatial_weights, src.transpose(0, 2, 1)).transpose(0, 2, 1)  # (B, T, N)
-        ts_out = ts_residual + (self.ts_dropout1(ts_out, key=key) if key is not None else self.ts_dropout(ts_out, inference=True))
+        ts_out = ts_residual + (self.ts_dropout1(ts_out, key=key) if key is not None else self.ts_dropout1(ts_out, inference=True))
         if not prenorm:
             ts_out = jax.vmap(jax.vmap(self.ts_norm1))(ts_out)
 
