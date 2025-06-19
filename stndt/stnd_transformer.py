@@ -422,7 +422,7 @@ class STNDT(eqx.Module):
                 num_heads=num_heads,
                 max_length=trial_length,
                 dropout=dropout,
-                hidden_size=config.get('HIDDEN_SIZE', None),  # Pass hidden_size 
+                hidden_size=config.get('HIDDEN_SIZE', 64),  # Pass hidden_size 
                 key=keys[i]
             )
             for i in range(num_layers)
