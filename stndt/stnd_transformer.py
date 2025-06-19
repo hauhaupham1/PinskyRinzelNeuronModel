@@ -61,7 +61,6 @@ class TemporalHead(eqx.Module):
     k : eqx.nn.Linear
     q : eqx.nn.Linear
     v : eqx.nn.Linear
-    mask : jnp.ndarray
     dropout : eqx.nn.Dropout
 
 
@@ -74,17 +73,20 @@ class TemporalHead(eqx.Module):
         self.k = eqx.nn.Linear(in_features=n_embed, out_features=head_size, use_bias=False, key=key_k)
         self.q = eqx.nn.Linear(in_features=n_embed, out_features=head_size, use_bias=False, key=key_q)
         self.v = eqx.nn.Linear(in_features=n_embed, out_features=head_size, use_bias=False, key=key_v)
-        self.mask = jnp.tril(jnp.ones((max_length, max_length), dtype=jnp.float32))
         self.dropout = eqx.nn.Dropout(dropout)
 
-    def __call__(self, x, key=None):
+    def __call__(self, x, src_mask=None, key=None):
         B, T, C = x.shape
         k = jax.vmap(jax.vmap(self.k))(x)  # (B, T, head_size)
         q = jax.vmap(jax.vmap(self.q))(x)  
         v = jax.vmap(jax.vmap(self.v))(x)  
         k_transpose = jnp.transpose(k, (0, 2, 1))
         scores = jnp.matmul(q, k_transpose) / jnp.sqrt(k.shape[-1])
-        scores = jnp.where(self.mask[:T, :T] == 0, -jnp.inf, scores)
+        
+        # Apply context mask if provided (limits attention window)
+        if src_mask is not None:
+            scores = scores + src_mask[:T, :T]
+        
         scores = jax.nn.softmax(scores, axis=-1)
         if key is not None:
             scores = self.dropout(scores, key=key)
@@ -145,8 +147,8 @@ class MultiheadTemporalAttention(eqx.Module):
         self.linear = eqx.nn.Linear(in_features=(num_heads * head_size), out_features=n_embed, use_bias=False, key=keys[-1])
         self.dropout = eqx.nn.Dropout(dropout)
 
-    def __call__(self, x, key=None):
-        head_out = [head(x, key=key) for head in self.heads]
+    def __call__(self, x, src_mask=None, key=None):
+        head_out = [head(x, src_mask=src_mask, key=key) for head in self.heads]
         out = jnp.concatenate(head_out, axis=-1)
         #apply output projection
         out = jax.vmap(jax.vmap(self.linear))(out)
@@ -250,13 +252,13 @@ class STNDTEncoder(eqx.Module):
         self.s_ln1 = eqx.nn.LayerNorm(max_length, eps=1e-6)  # Normalize along T dimension for spatial
         self.fusion_ln = eqx.nn.LayerNorm(n_embed, eps=1e-6)
 
-    def __call__(self, x_T, x_S, key = None):
+    def __call__(self, x_T, x_S, src_mask=None, key=None):
         #Temporal attention
         if key is None:
             key = jr.PRNGKey(6)
         key_temporal, key_spatial, key_ff1, key_ff2 = jr.split(key, 4)
         ln_x_T = jax.vmap(jax.vmap(self.t_ln1))(x_T)
-        temporal_attn_out = self.temporal_attention(ln_x_T, key=key_temporal)
+        temporal_attn_out = self.temporal_attention(ln_x_T, src_mask=src_mask, key=key_temporal)
         #Residual connection
         x = x_T + temporal_attn_out
 
@@ -310,6 +312,13 @@ class STNDT(eqx.Module):
     norm: Optional[eqx.Module]
     projector: eqx.Module
     spatial_projector: eqx.Module
+    # Manual projector components (when LINEAR_PROJECTOR=False)
+    projector_linear1: eqx.Module
+    projector_activation: eqx.Module
+    projector_linear2: eqx.Module
+    spatial_projector_linear1: eqx.Module
+    spatial_projector_activation: eqx.Module
+    spatial_projector_linear2: eqx.Module
     # Decoder components defined below
     rate_dropout: eqx.nn.Dropout
     
@@ -422,43 +431,71 @@ class STNDT(eqx.Module):
             if config.get('LINEAR_PROJECTOR', False):
                 self.projector = eqx.nn.Linear(num_neurons, num_neurons, key=key1)
                 self.spatial_projector = eqx.nn.Linear(trial_length, trial_length, key=key2)
+                # Set manual projector components to Identity
+                self.projector_linear1 = eqx.nn.Identity()
+                self.projector_activation = eqx.nn.Identity()
+                self.projector_linear2 = eqx.nn.Identity()
+                self.spatial_projector_linear1 = eqx.nn.Identity()
+                self.spatial_projector_activation = eqx.nn.Identity()
+                self.spatial_projector_linear2 = eqx.nn.Identity()
             else:
                 key1_split1, key1_split2 = jr.split(key1)
                 key2_split1, key2_split2 = jr.split(key2)
-                self.projector = eqx.nn.Sequential([
-                    eqx.nn.Linear(num_neurons, 1024, key=key1_split1),
-                    eqx.nn.PReLU(init_alpha=0.01),
-                    eqx.nn.Linear(1024, num_neurons, key=jr.split(key1_split2))
-                ])
-                self.spatial_projector = eqx.nn.Sequential([
-                    eqx.nn.Linear(trial_length, 1024, key=key2_split1),
-                    eqx.nn.PReLU(init_alpha=0.01),
-                    eqx.nn.Linear(1024, trial_length, key=jr.split(key2_split2))
-                ])
+                # Manual projector layers (avoid Sequential key issues)
+                self.projector_linear1 = eqx.nn.Linear(num_neurons, 1024, key=key1_split1)
+                self.projector_activation = eqx.nn.PReLU(init_alpha=0.01)
+                self.projector_linear2 = eqx.nn.Linear(1024, num_neurons, key=key1_split2)
+                
+                self.spatial_projector_linear1 = eqx.nn.Linear(trial_length, 1024, key=key2_split1)
+                self.spatial_projector_activation = eqx.nn.PReLU(init_alpha=0.01)
+                self.spatial_projector_linear2 = eqx.nn.Linear(1024, trial_length, key=key2_split2)
+                # Set simple projectors to Identity
+                self.projector = eqx.nn.Identity()
+                self.spatial_projector = eqx.nn.Identity()
         else:
             self.projector = eqx.nn.Identity()
             self.spatial_projector = eqx.nn.Identity()
+            # Set manual projector components to Identity
+            self.projector_linear1 = eqx.nn.Identity()
+            self.projector_activation = eqx.nn.Identity()
+            self.projector_linear2 = eqx.nn.Identity()
+            self.spatial_projector_linear1 = eqx.nn.Identity()
+            self.spatial_projector_activation = eqx.nn.Identity()
+            self.spatial_projector_linear2 = eqx.nn.Identity()
         
         # Rate dropout
         self.rate_dropout = eqx.nn.Dropout(config.get('DROPOUT_RATES', 0.0))
         
         # Decoder
         key1, key2, key = jr.split(key, 3)
+        initrange = config.get('INIT_RANGE', 0.1)
         if config.get('LOSS', {}).get('TYPE') == "poisson":
             self.decoder_layers_count = config.get('DECODER', {}).get('LAYERS', 1)
             self.use_lograte = config.get('LOGRATE', False)
             
             if self.decoder_layers_count == 1:
-                self.decoder_linear = eqx.nn.Linear(num_neurons, num_neurons, key=key1)
-                self.decoder_activation = eqx.nn.Identity()
-                self.decoder_linear2 = eqx.nn.Identity()
+                temp_decoder_linear = eqx.nn.Linear(num_neurons, num_neurons, key=key1)
+                temp_decoder_activation = eqx.nn.Identity()
+                temp_decoder_linear2 = eqx.nn.Identity()
             else:
-                self.decoder_linear = eqx.nn.Linear(num_neurons, 16, key=key1)
-                self.decoder_activation = eqx.nn.PReLU(init_alpha=0.01)
-                self.decoder_linear2 = eqx.nn.Linear(16, num_neurons, key=key2)
+                temp_decoder_linear = eqx.nn.Linear(num_neurons, 16, key=key1)
+                temp_decoder_activation = eqx.nn.PReLU(init_alpha=0.01)
+                temp_decoder_linear2 = eqx.nn.Linear(16, num_neurons, key=key2)
+
+            key, weight_key = jr.split(key, 2)
+            weights = jr.uniform(weight_key, temp_decoder_linear.weight.shape, minval=-initrange, maxval=initrange)
+            bias = jnp.zeros_like(temp_decoder_linear.bias)
+
+            final_decoder_linear = eqx.tree_at(lambda layer: (layer.weight, layer.bias),
+                                                temp_decoder_linear, (weights, bias))
+            
+            self.decoder_linear = final_decoder_linear
+            self.decoder_activation = temp_decoder_activation
+            self.decoder_linear2 = temp_decoder_linear2
             
             if not self.use_lograte:
-                self.final_activation = eqx.nn.PReLU(init_alpha=0.01)
+                # self.final_activation = eqx.nn.PReLU(init_alpha=0.01)
+                self.final_activation = eqx.nn.Lambda(jax.nn.softplus)
             else:
                 self.final_activation = eqx.nn.Identity()
     
@@ -471,23 +508,23 @@ class STNDT(eqx.Module):
         if context_forward < 0:
             context_forward = size
             
-        # Create forward-looking mask
-        mask = jnp.triu(jnp.ones((size, size)), k=-context_forward).T
+        # Create forward-looking mask (boolean)
+        mask = jnp.triu(jnp.ones((size, size), dtype=bool), k=-context_forward).T
         
         # Apply backward context if specified
         if context_backward > 0:
-            back_mask = jnp.triu(jnp.ones((size, size)), k=-context_backward)
+            back_mask = jnp.triu(jnp.ones((size, size), dtype=bool), k=-context_backward)
             mask = mask & back_mask
             
             # Expose initial segment for initial conditions
             if expose_ic and self.config.get('CONTEXT_WRAP_INITIAL', False):
-                initial_mask = jnp.triu(jnp.ones((context_backward, context_backward)))
+                initial_mask = jnp.triu(jnp.ones((context_backward, context_backward), dtype=bool))
                 mask = mask.at[:context_backward, :context_backward].set(
                     mask[:context_backward, :context_backward] | initial_mask
                 )
         
-        # Convert binary mask to attention mask (0 -> -inf, 1 -> 0)
-        return jnp.where(mask == 0, -jnp.inf, 0.0)
+        # Convert binary mask to attention mask (False -> -inf, True -> 0)
+        return jnp.where(mask, 0.0, -jnp.inf)
     
     def apply_decoder(self, x):
         """Apply decoder layers manually"""
@@ -497,11 +534,40 @@ class STNDT(eqx.Module):
         x = self.final_activation(x)    # Either PReLU or Identity
         return x
     
+    def apply_projector(self, x):
+        """Apply projector layers manually"""
+        if not isinstance(self.projector, eqx.nn.Identity):
+            return self.projector(x)
+        elif not isinstance(self.projector_linear1, eqx.nn.Identity):
+            # Manual 3-layer projector
+            x = self.projector_linear1(x)
+            x = self.projector_activation(x)
+            x = self.projector_linear2(x)
+            return x
+        else:
+            return x  # Identity
+    
+    def apply_spatial_projector(self, x):
+        """Apply spatial projector layers manually"""
+        if not isinstance(self.spatial_projector, eqx.nn.Identity):
+            return self.spatial_projector(x)
+        elif not isinstance(self.spatial_projector_linear1, eqx.nn.Identity):
+            # Manual 3-layer spatial projector
+            x = self.spatial_projector_linear1(x)
+            x = self.spatial_projector_activation(x)
+            x = self.spatial_projector_linear2(x)
+            return x
+        else:
+            return x  # Identity
+    
     def info_nce_loss(self, features: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        """Compute InfoNCE loss for contrastive learning"""
+        """
+        Compute InfoNCE loss for contrastive learning
+        Adapted from PyTorch implementation but using JAX-compatible operations
+        """
         batch_size = features.shape[0] // 2
         
-        # Create labels
+        # Create labels - same as PyTorch
         labels = jnp.concatenate([jnp.arange(batch_size) for _ in range(self.n_views)])
         labels = (labels[:, None] == labels[None, :]).astype(jnp.float32)
         
@@ -511,21 +577,32 @@ class STNDT(eqx.Module):
         # Compute similarity matrix
         similarity_matrix = jnp.matmul(features, features.T)
         
-        # Remove diagonal
-        mask = jnp.eye(labels.shape[0], dtype=bool)
-        labels = labels[~mask].reshape(labels.shape[0], -1)
-        similarity_matrix = similarity_matrix[~mask].reshape(similarity_matrix.shape[0], -1)
+        # Remove diagonal using masking (JAX-compatible way)
+        eye_mask = jnp.eye(labels.shape[0])
+        # Use where to remove diagonal elements
+        labels_no_diag = jnp.where(eye_mask[..., None], 0, labels.reshape(labels.shape[0], labels.shape[1], 1))
+        labels_no_diag = labels_no_diag.reshape(-1, labels.shape[1])
         
-        # Extract positives and negatives
-        positives = similarity_matrix[labels.astype(bool)].reshape(labels.shape[0], -1)
-        negatives = similarity_matrix[~labels.astype(bool)].reshape(similarity_matrix.shape[0], -1)
+        sim_no_diag = jnp.where(eye_mask[..., None], 0, similarity_matrix.reshape(similarity_matrix.shape[0], similarity_matrix.shape[1], 1))
+        sim_no_diag = sim_no_diag.reshape(-1, similarity_matrix.shape[1])
         
-        # Compute logits
+        # Extract positives and negatives using where instead of boolean indexing
+        pos_mask = labels_no_diag.astype(bool)
+        neg_mask = ~pos_mask
+        
+        # For each row, get positive and negative similarities
+        positives = jnp.where(pos_mask, sim_no_diag, -jnp.inf)
+        negatives = jnp.where(neg_mask, sim_no_diag, -jnp.inf)
+        
+        # Take max positive per row (should be only one)
+        positives = jnp.max(positives, axis=1, keepdims=True)
+        
+        # Concatenate positives and negatives
         logits = jnp.concatenate([positives, negatives], axis=1)
-        labels = jnp.zeros(logits.shape[0], dtype=jnp.int32)
+        target_labels = jnp.zeros(logits.shape[0], dtype=jnp.int32)
         
         logits = logits / self.temperature
-        return logits, labels
+        return logits, target_labels
     
     def __call__(
         self,
@@ -560,7 +637,7 @@ class STNDT(eqx.Module):
         key, subkey = jr.split(key)
         src = self.src_pos_encoder(src, key=subkey)
         
-        # Generate masks
+        # Generate context mask for attention
         src_mask = self._generate_context_mask(
             src.shape[0],
             self.config.get('CONTEXT_FORWARD', -1),
@@ -577,13 +654,15 @@ class STNDT(eqx.Module):
                 # First layer: x_T is temporal (T, B, N), x_S is spatial (N, B, T)
                 src, spatial_weights = encoder(src.transpose(1, 0, 2), 
                                              spatial_src.transpose(1, 0, 2), 
+                                             src_mask=src_mask,
                                              key=subkey)
                 src = src.transpose(1, 0, 2)  # Back to (T, B, N)
             else:
                 # Subsequent layers: both inputs are (B, T, N) -> convert to expected format
                 src_for_layer = src.transpose(1, 0, 2)  # (T, B, N) -> (B, T, N)
                 spatial_for_layer = src.transpose(1, 0, 2).transpose(0, 2, 1)  # (T, B, N) -> (B, T, N) -> (B, N, T)
-                src_out, spatial_weights = encoder(src_for_layer, spatial_for_layer, key=subkey)
+                src_out, spatial_weights = encoder(src_for_layer, spatial_for_layer, 
+                                                 src_mask=src_mask, key=subkey)
                 src = src_out.transpose(1, 0, 2)  # Back to (T, B, N)
             
             if return_outputs:
@@ -612,7 +691,7 @@ class STNDT(eqx.Module):
         if self.config.get('LOSS', {}).get('TYPE') == "poisson":
             if self.config.get('LOGRATE', False):
                 # Log-space Poisson loss
-                decoder_loss = mask_labels * jnp.exp(decoder_rates) - decoder_rates * mask_labels
+                decoder_loss = jnp.exp(decoder_rates) - mask_labels * decoder_rates
             else:
                 # Standard Poisson loss
                 decoder_loss = decoder_rates - mask_labels * jnp.log(decoder_rates + 1e-8)
@@ -642,12 +721,14 @@ class STNDT(eqx.Module):
                 if i == 0:
                     src1, _ = encoder(src1.transpose(1, 0, 2), 
                                      spatial_contrast1.transpose(1, 0, 2), 
+                                     src_mask=src_mask,
                                      key=subkey)
                     src1 = src1.transpose(1, 0, 2)
                 else:
                     src1_for_layer = src1.transpose(1, 0, 2)
                     spatial1_for_layer = src1.transpose(1, 0, 2).transpose(0, 2, 1)
-                    src1_out, _ = encoder(src1_for_layer, spatial1_for_layer, key=subkey)
+                    src1_out, _ = encoder(src1_for_layer, spatial1_for_layer, 
+                                        src_mask=src_mask, key=subkey)
                     src1 = src1_out.transpose(1, 0, 2)
                 layer_outputs_contrast1.append(src1.transpose(1, 0, 2))
             
@@ -679,12 +760,14 @@ class STNDT(eqx.Module):
                 if i == 0:
                     src2, _ = encoder(src2.transpose(1, 0, 2), 
                                      spatial_contrast2.transpose(1, 0, 2), 
+                                     src_mask=src_mask,
                                      key=subkey)
                     src2 = src2.transpose(1, 0, 2)
                 else:
                     src2_for_layer = src2.transpose(1, 0, 2)
                     spatial2_for_layer = src2.transpose(1, 0, 2).transpose(0, 2, 1)
-                    src2_out, _ = encoder(src2_for_layer, spatial2_for_layer, key=subkey)
+                    src2_out, _ = encoder(src2_for_layer, spatial2_for_layer, 
+                                        src_mask=src_mask, key=subkey)
                     src2 = src2_out.transpose(1, 0, 2)
                 layer_outputs_contrast2.append(src2.transpose(1, 0, 2))
             
@@ -713,8 +796,8 @@ class STNDT(eqx.Module):
                 out2 = layer_outputs_contrast2[layer_idx]
             
             # Apply projector and flatten
-            out1 = jax.vmap(jax.vmap(self.projector))(out1)  # (B, T, N)
-            out2 = jax.vmap(jax.vmap(self.projector))(out2)  # (B, T, N)
+            out1 = jax.vmap(jax.vmap(self.apply_projector))(out1)  # (B, T, N)
+            out2 = jax.vmap(jax.vmap(self.apply_projector))(out2)  # (B, T, N)
             out1 = out1.reshape(out1.shape[0], -1)  # (B, T*N)
             out2 = out2.reshape(out2.shape[0], -1)  # (B, T*N)
             
@@ -739,8 +822,8 @@ class STNDT(eqx.Module):
                 spatial_embed1 = spatial_contrast1.transpose(1, 0, 2)  # (B, N, T)
                 spatial_embed2 = spatial_contrast2.transpose(1, 0, 2)
                 
-                spatial_out1 = jax.vmap(jax.vmap(self.spatial_projector))(spatial_embed1)
-                spatial_out2 = jax.vmap(jax.vmap(self.spatial_projector))(spatial_embed2)
+                spatial_out1 = jax.vmap(jax.vmap(self.apply_spatial_projector))(spatial_embed1)
+                spatial_out2 = jax.vmap(jax.vmap(self.apply_spatial_projector))(spatial_embed2)
                 spatial_out1 = spatial_out1.reshape(spatial_out1.shape[0], -1)
                 spatial_out2 = spatial_out2.reshape(spatial_out2.shape[0], -1)
                 
