@@ -64,7 +64,7 @@ class TemporalHead(eqx.Module):
     dropout : eqx.nn.Dropout
 
 
-    def __init__(self, n_embed, head_size, max_length, dropout=0.1, key=None):
+    def __init__(self, n_embed, head_size, dropout=0.1, key=None):
         if key is None:
             key = jr.PRNGKey(0)
     
@@ -136,13 +136,13 @@ class MultiheadTemporalAttention(eqx.Module):
     dropout: eqx.nn.Dropout
 
 
-    def __init__(self, n_embed, num_heads, max_length=100, dropout=0.1, key=None):
+    def __init__(self, n_embed, num_heads, dropout=0.1, key=None):
         if key is None:
             key = jr.PRNGKey(2)
 
         head_size = n_embed // num_heads
         keys = jr.split(key, num_heads + 1)
-        self.heads = [TemporalHead(n_embed=n_embed, head_size=head_size, max_length=max_length, dropout=dropout, key=keys[i]) for i in range(num_heads)]
+        self.heads = [TemporalHead(n_embed=n_embed, head_size=head_size, dropout=dropout, key=keys[i]) for i in range(num_heads)]
         #ouput projection, 
         self.linear = eqx.nn.Linear(in_features=(num_heads * head_size), out_features=n_embed, use_bias=False, key=keys[-1])
         self.dropout = eqx.nn.Dropout(dropout)
@@ -177,47 +177,6 @@ class MultiheadSpatialAttention(eqx.Module):
         return out
 
 
-class FeedForward(eqx.Module):
-    linear1: eqx.nn.Linear
-    activation: eqx.nn.Lambda
-    linear2: eqx.nn.Linear
-    dropout: eqx.nn.Dropout
-
-
-    def __init__(self, n_embed, dropout=0.1, expansion_factor = 4, hidden_size=None, key = None):
-        if key is None:
-            key = jr.PRNGKey(4)
-
-        key1, key2 = jr.split(key)
-        # If hidden_size is provided, use it directly. Otherwise use expansion_factor
-        if hidden_size is not None:
-            hidden_dim = hidden_size
-        else:
-            hidden_dim = expansion_factor * n_embed
-            
-        self.linear1 = eqx.nn.Linear(in_features=n_embed, out_features=hidden_dim, use_bias=True, key=key1)
-        self.activation = eqx.nn.PReLU(init_alpha=0.01)
-        self.linear2 = eqx.nn.Linear(in_features=hidden_dim, out_features=n_embed, use_bias=True, key=key2)
-        self.dropout = eqx.nn.Dropout(dropout)
-
-    def __call__(self, x, key=None):
-        if key is not None:
-            keys = jr.split(key, 2)
-        else:
-            keys = [None, None]
-        x = jax.vmap(jax.vmap(self.linear1))(x)
-        x = jax.vmap(jax.vmap(self.activation))(x)
-        if key is not None:
-            x = self.dropout(x, key=keys[0])
-        else:
-            x = self.dropout(x, inference=True)
-        x = jax.vmap(jax.vmap(self.linear2))(x)
-        if key is not None:
-            x = self.dropout(x, key=keys[1])
-        else:
-            x = self.dropout(x, inference=True)
-
-        return x
 
 
 class SpikeProjection(eqx.Module):
@@ -236,61 +195,104 @@ class SpikeProjection(eqx.Module):
 class STNDTEncoder(eqx.Module):
     temporal_attention: MultiheadTemporalAttention
     spatial_attention: MultiheadSpatialAttention
-    feed_forward_1: FeedForward
-    feed_forward_2: FeedForward
-    t_ln1: eqx.nn.LayerNorm
-    t_ln2: eqx.nn.LayerNorm
-    s_ln1: eqx.nn.LayerNorm
-    fusion_ln: eqx.nn.LayerNorm
+    activation: eqx.nn.PReLU
+    linear1: eqx.nn.Linear
+    linear2: eqx.nn.Linear
+    ts_linear1: eqx.nn.Linear
+    ts_linear2: eqx.nn.Linear
+    norm1: eqx.nn.LayerNorm
+    norm2: eqx.nn.LayerNorm 
+    ts_norm1: eqx.nn.LayerNorm
+    ts_norm2: eqx.nn.LayerNorm
+    dropout: eqx.nn.Dropout
+    dropout1: eqx.nn.Dropout
+    ts_dropout1: eqx.nn.Dropout
+    ts_dropout2: eqx.nn.Dropout
+    ts_dropout3: eqx.nn.Dropout
+    spatial_norm_1: eqx.nn.LayerNorm
+
 
     def __init__(self, n_embed, num_heads, max_length=100, dropout=0.1, hidden_size=None, key=None):
         if key is None:
             key = jr.PRNGKey(5)
 
         keys = jr.split(key, 3)
-        self.temporal_attention = MultiheadTemporalAttention(n_embed=n_embed, num_heads=num_heads, max_length=max_length, dropout=dropout, key=keys[0])
+        self.temporal_attention = MultiheadTemporalAttention(n_embed=n_embed, num_heads=num_heads, dropout=dropout, key=keys[0])
         self.spatial_attention = MultiheadSpatialAttention(trial_length=max_length, num_heads=num_heads, dropout=dropout, key=keys[1])
-        key_ff1, key_ff2 = jr.split(keys[2], 2)
-        self.feed_forward_1 = FeedForward(n_embed=n_embed, dropout=dropout, hidden_size=hidden_size, key=key_ff1)
-        self.feed_forward_2 = FeedForward(n_embed=n_embed, dropout=dropout, hidden_size=hidden_size, key=key_ff2)
-        self.t_ln1 = eqx.nn.LayerNorm(n_embed, eps=1e-6)
-        self.t_ln2 = eqx.nn.LayerNorm(n_embed, eps=1e-6)
-        self.s_ln1 = eqx.nn.LayerNorm(max_length, eps=1e-6)  # Normalize along T dimension for spatial
-        self.fusion_ln = eqx.nn.LayerNorm(n_embed, eps=1e-6)
+        key_ln1, key_ln2, key_ts_linear1, key_ts_linear2 = jr.split(keys[2], 4)
+        self.activation = eqx.nn.PReLU(init_alpha=0.01)
+        self.linear1 = eqx.nn.Linear(in_features=n_embed, out_features=hidden_size, use_bias=True, key=key_ln1)
+        self.linear2 = eqx.nn.Linear(in_features=hidden_size, out_features=n_embed, use_bias=True, key=key_ln2)
+        self.ts_linear1 = eqx.nn.Linear(in_features=n_embed, out_features=hidden_size, use_bias=True, key=key_ts_linear1)
+        self.ts_linear2 = eqx.nn.Linear(in_features=hidden_size, out_features=n_embed, use_bias=True, key=key_ts_linear2)
+        self.norm1 = eqx.nn.LayerNorm(n_embed)
+        self.norm2 = eqx.nn.LayerNorm(n_embed)
+        self.ts_norm1 = eqx.nn.LayerNorm(n_embed)
+        self.ts_norm2 = eqx.nn.LayerNorm(n_embed)
+        self.dropout = eqx.nn.Dropout(dropout)
+        self.dropout1 = eqx.nn.Dropout(dropout)
+        self.ts_dropout1 = eqx.nn.Dropout(dropout)
+        self.ts_dropout2 = eqx.nn.Dropout(dropout)
+        self.ts_dropout3 = eqx.nn.Dropout(dropout)
+        self.spatial_norm_1 = eqx.nn.LayerNorm(max_length)
 
-    def __call__(self, x_T, x_S, src_mask=None, key=None):
-        #Temporal attention
+    def __call__(self, src, spatial_src, src_mask=None, key=None, prenorm=False):
         if key is None:
             key = jr.PRNGKey(6)
-        key_temporal, key_spatial, key_ff1, key_ff2 = jr.split(key, 4)
-        ln_x_T = jax.vmap(jax.vmap(self.t_ln1))(x_T)
-        temporal_attn_out = self.temporal_attention(ln_x_T, src_mask=src_mask, key=key_temporal)
-        #Residual connection
-        x = x_T + temporal_attn_out
+        residual = src
+        if prenorm:
+            src = jax.vmap(jax.vmap(self.norm1))(src)
 
-        #Feed forward for temporal features
-        ln_x = jax.vmap(jax.vmap(self.t_ln2))(x)
-        ff_out = self.feed_forward_1(ln_x, key=key_ff1)
-        temporal_out = x + ff_out     #Z_T
+        # Apply temporal attention
+        key_t, key_drop_1 = jr.split(key)
+        t_out = self.temporal_attention(src, src_mask=src_mask, key=key_t)
+        src = residual + (self.dropout1(t_out, key=key_drop_1) if key is not None else self.dropout1(t_out, inference=True))
 
-        #Spatial attention
-        # x_S has shape (B, N, T), normalize along T dimension
-        ln_x_S = jax.vmap(jax.vmap(self.s_ln1))(x_S)
-        spatial_weights = self.spatial_attention(ln_x_S, key=key_spatial)
+        if not prenorm:
+            src = jax.vmap(jax.vmap(self.norm1))(src)
+        residual = src
+        if prenorm:
+            src = jax.vmap(jax.vmap(self.norm2))(src)
+        
+        src2 = jax.vmap(jax.vmap(self.linear1))(src)
+        src2 = jax.vmap(jax.vmap(self.activation))(src2)
+        src2 = self.dropout(src2, key=key) if key is not None else self.dropout(src2, inference=True)
+        src2 = jax.vmap(jax.vmap(self.linear2))(src2)
+        
+        src = residual + (self.dropout(src2, key=key) if key is not None else self.dropout(src2, inference=True))
 
-        t_permuted = jnp.transpose(temporal_out, (0, 2, 1))  # (B, N, T)
+        if not prenorm:
+            src = jax.vmap(jax.vmap(self.norm2))(src)
 
-        #fusion mechanism
-        fused = jnp.matmul(spatial_weights, t_permuted)  # (B, N, T)
-        fused_permuted = jnp.transpose(fused, (0, 2, 1))  # (B, T, N)
+        spatial_residual = spatial_src
+        if prenorm:
+            spatial_src = jax.vmap(jax.vmap(self.spatial_norm_1))(spatial_src)
+        spatial_weights = self.spatial_attention(spatial_src, key=key)
 
-        x = temporal_out + fused_permuted  # (B, T, N)
+        ts_residual = src
+        if prenorm:
+            src = jax.vmap(jax.vmap(self.ts_norm1))(src)
+        
+        ts_out = jnp.matmul(spatial_weights, src.transpose(0, 2, 1)).transpose(0, 2, 1)  # (B, T, N)
+        ts_out = ts_residual + (self.ts_dropout1(ts_out, key=key) if key is not None else self.ts_dropout(ts_out, inference=True))
+        if not prenorm:
+            ts_out = jax.vmap(jax.vmap(self.ts_norm1))(ts_out)
 
-        ln_x = jax.vmap(jax.vmap(self.fusion_ln))(x)
-        ff_out = self.feed_forward_2(ln_x, key=key_ff2)
-        out = x + ff_out
-        return out, spatial_weights
+        ts_residual = ts_out
+        if prenorm:
+            ts_out = jax.vmap(jax.vmap(self.ts_norm2))(ts_out)
 
+        ts_out = jax.vmap(jax.vmap(self.ts_linear1))(ts_out)
+        ts_out = jax.vmap(jax.vmap(self.activation))(ts_out)
+        ts_out = self.ts_dropout2(ts_out, key=key) if key is not None else self.ts_dropout2(ts_out, inference=True)
+        ts_out = jax.vmap(jax.vmap(self.ts_linear2))(ts_out)
+
+
+        ts_out = ts_residual + (self.ts_dropout3(ts_out, key=key) if key is not None else self.ts_dropout3(ts_out, inference=True))
+        if not prenorm:
+            ts_out = jax.vmap(jax.vmap(self.ts_norm2))(ts_out)
+
+        return ts_out, spatial_weights  
 
 class ScaleNorm(eqx.Module):
     """ScaleNorm for JAX/Equinox"""
