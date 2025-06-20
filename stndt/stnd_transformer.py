@@ -514,6 +514,9 @@ class STNDT(eqx.Module):
         # Convert binary mask to attention mask (False -> -inf, True -> 0)
         return jnp.where(mask, 0.0, -jnp.inf)
     
+
+
+    
     
     
     def info_nce_loss(self, features: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
@@ -521,44 +524,23 @@ class STNDT(eqx.Module):
         Compute InfoNCE loss for contrastive learning
         Adapted from PyTorch implementation but using JAX-compatible operations
         """
-        batch_size = features.shape[0] // 2
-        
-        # Create labels - same as PyTorch
-        labels = jnp.concatenate([jnp.arange(batch_size) for _ in range(self.n_views)])
-        labels = (labels[:, None] == labels[None, :]).astype(jnp.float32)
-        
-        # Normalize features
-        features = features / jnp.linalg.norm(features, axis=1, keepdims=True)
-        
-        # Compute similarity matrix
-        similarity_matrix = jnp.matmul(features, features.T)
-        
-        # Remove diagonal using masking (JAX-compatible way)
-        eye_mask = jnp.eye(labels.shape[0])
-        # Use where to remove diagonal elements
-        labels_no_diag = jnp.where(eye_mask[..., None], 0, labels.reshape(labels.shape[0], labels.shape[1], 1))
-        labels_no_diag = labels_no_diag.reshape(-1, labels.shape[1])
-        
-        sim_no_diag = jnp.where(eye_mask[..., None], 0, similarity_matrix.reshape(similarity_matrix.shape[0], similarity_matrix.shape[1], 1))
-        sim_no_diag = sim_no_diag.reshape(-1, similarity_matrix.shape[1])
-        
-        # Extract positives and negatives using where instead of boolean indexing
-        pos_mask = labels_no_diag.astype(bool)
-        neg_mask = ~pos_mask
-        
-        # For each row, get positive and negative similarities
-        positives = jnp.where(pos_mask, sim_no_diag, -jnp.inf)
-        negatives = jnp.where(neg_mask, sim_no_diag, -jnp.inf)
-        
-        # Take max positive per row (should be only one)
-        positives = jnp.max(positives, axis=1, keepdims=True)
-        
-        # Concatenate positives and negatives
-        logits = jnp.concatenate([positives, negatives], axis=1)
-        target_labels = jnp.zeros(logits.shape[0], dtype=jnp.int32)
-        
+        n_total = features.shape[0]
+        batch_size = n_total // self.n_views
+        arange_labels = jnp.arange(batch_size)
+        labels_matrix = jnp.concatenate([arange_labels for _ in range(self.n_views)], axis=0)
+        pos_mask = jnp.expand_dims(labels_matrix, 0) == jnp.expand_dims(labels_matrix, 1)
+
+        features_norm = l2_normalize(features, axis=1)
+        similarity_matrix = jnp.matmul(features_norm, features_norm.T)
+
+        diag_mask = jnp.eye(n_total, dtype=bool)
+        pos_mask = pos_mask & ~diag_mask
+
+        labels = jnp.argmax(pos_mask, axis=1)
+        logits = jnp.where(diag_mask, -jnp.inf, similarity_matrix)
         logits = logits / self.temperature
-        return logits, target_labels
+
+        return logits, labels
     
     def __call__(
         self,
@@ -821,3 +803,8 @@ class STNDT(eqx.Module):
                 jnp.stack(layer_outputs, axis=-1) if return_outputs else None,
             )
 
+
+
+def l2_normalize(x, axis=1, epsilon=1e-12):
+    norm = jnp.linalg.norm(x, axis=axis, keepdims=True)
+    return x/ jnp.maximum(norm, epsilon)
