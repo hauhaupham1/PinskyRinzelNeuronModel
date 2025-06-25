@@ -582,7 +582,7 @@ class STNDT(eqx.Module):
 
         # For spatial attention: (B, N, T)
         spatial_src = src.transpose(0, 2, 1)
-        print(f"Spatial src shape after transpose: {spatial_src.shape}")
+        # print(f"Spatial src shape after transpose: {spatial_src.shape}")
         if self.config.get('LINEAR_EMBEDDER'):
             print(f"Spatial embedder input size: {self.trial_length}, output size: {self.num_spatial_input}")
             spatial_src = jax.vmap(jax.vmap(self.spatial_embedder))(spatial_src)
