@@ -4,17 +4,28 @@ from stnd_transformer import STNDT
 import jax
 import jax.numpy as jnp
 import jax.random as jr
-from losses import compute_forecasting_loss
+from losses import compute_forecasting_loss, discrete_aware_regression_loss
 import optax
 import equinox as eqx
-from mask import create_forward_prediction_mask
+from mask import create_forward_prediction_mask, get_mixed_batch, create_reconstruction_mask
 import matplotlib.pyplot as plt
 import numpy as np
 
-jax.config.update("jax_enable_x64", False)
-jax.config.update("jax_platform_name", "cpu")  
+# Training parameters (epoch-based approach)
+batch_size = 128
+num_epochs = 10  
+learning_rate = 1e-2
+num_forward_steps = 5
 
-# Training configuration
+# Load data
+train_data = load_s1_train()
+#use first 1000 samples for training
+train_data = train_data[:10000]
+test_data = load_s1_test()
+max_spikes = 5
+num_batches = len(train_data) // batch_size
+
+
 def config():
     return{
         'EMBED_DIM': 1,
@@ -23,34 +34,23 @@ def config():
         'LINEAR_PROJECTOR' : False,
         'DROPOUT_RATES': 0.1,
         'SCALE_NORM': True,
-        'NUM_LAYERS': 6,
+        'NUM_LAYERS': 4,
         'DECODER': {
             'LAYERS': 1,
         },
-        'LOGRATE': True,
-        'NUM_HEADS': 2,  # Reduced from 8 for faster training
+        'LOSS': {
+            'TYPE': 'poisson',  # Use Poisson NLL loss
+        },
+        'LOGRATE': True,  # Work in log-rate space
+        'NUM_HEADS': 4,
         'DROPOUT': 0.1,
-        'HIDDEN_SIZE': 64,
+        'HIDDEN_SIZE': 128,
         'PRE_NORM': False,
         'FULL_CONTEXT': False,
         'CONTEXT_FORWARD': 0,
         'CONTEXT_BACKWARD': -1,
-        'MASK_STRATEGY': 'all',  # 'all', 'only_spikes', 'balanced', or 'weighted'
-        'SPIKE_WEIGHT': 5.0,  # Weight multiplier for spike positions when using 'weighted' strategy
+        'MAX_SPIKES': max_spikes,
     }
-
-
-
-# Training parameters (epoch-based approach)
-batch_size = 128  # Reduce for memory stability
-num_epochs = 10  
-learning_rate = 1e-2
-num_forward_steps = 5
-
-# Load data
-train_data = load_s1_train()
-test_data = load_s1_test()
-num_batches = len(train_data) // batch_size
 
 print(f"Training samples: {len(train_data)}")
 print(f"Test samples: {len(test_data)}")
@@ -63,15 +63,17 @@ model = STNDT(
     config=config(),
     trial_length=125, 
     num_neurons=11,
-    max_spikes=50,
+    max_spikes=5,
     key=model_key
 )
 
 total_steps = num_epochs * num_batches
+# Use smaller warmup for small dataset
+warmup_steps = min(10, total_steps // 4)  # Use 10 or 1/4 of total steps
 schedule = optax.warmup_cosine_decay_schedule(
     init_value=0.0,
     peak_value=learning_rate,
-    warmup_steps=100,  # 100 warmup steps
+    warmup_steps=warmup_steps,
     decay_steps=total_steps
 )
 
@@ -82,46 +84,76 @@ optimizer = optax.chain(
 params, static = eqx.partition(model, eqx.is_inexact_array)
 opt_state = optimizer.init(params)
 
-# Define loss function for forecasting
-def loss_fn(params, batch_data, key):
+# Define loss function for mixed training (reconstruction + forecasting)
+def loss_fn(params, batch_data, key, forecast_ratio=0.3):
     # Reconstruct model from params and static parts
     model = eqx.combine(params, static)
-    mask_strategy = config().get('MASK_STRATEGY', 'all')
-    input_data, mask_labels = create_forward_prediction_mask(batch_data, num_forward_steps, mask_strategy=mask_strategy)
-    predictions = model(input_data, key=key)
-    return compute_forecasting_loss(predictions=predictions, mask_labels=mask_labels, config=config())
+    
+    # Split key for different operations
+    key1, key2 = jr.split(key)
+    
+    # Get mixed batch: some samples for forecasting, others for reconstruction
+    # (forecast_input, forecast_labels), (recon_input, recon_labels) = get_mixed_batch(
+    #     batch_data, forecast_ratio=forecast_ratio, num_forward_steps=num_forward_steps, key=key1
+    # )
+    
+    # # Combine inputs and labels
+    # mixed_input = jnp.concatenate([forecast_input, recon_input], axis=0)
+    # mixed_labels = jnp.concatenate([forecast_labels, recon_labels], axis=0)
+    mixed_input, mixed_labels = create_reconstruction_mask(
+        batch_data, key1, mask_ratio=0.15, mode="full",
+        mask_token_ratio=0.8, use_zero_mask=False, max_spikes=max_spikes
+    )
+    # Forward pass - model computes loss internally
+    # Returns: (loss, decoder_loss, contrast_loss) or just loss
+    outputs = model.forward(mixed_input, mixed_labels, key=key2)
+    
+    # Handle different return formats from model
+    if isinstance(outputs, tuple):
+        loss = outputs[0]  # Main loss
+    else:
+        loss = outputs
+    
+    return loss
 
-# Training step with parameter filtering (adapted from train_transformer.py)
+# Training step with parameter filtering 
 @eqx.filter_jit
-def train_step_filtered(params, static, optimizer, opt_state, batch_data, key):
-    loss_value, grads = eqx.filter_value_and_grad(loss_fn)(params, batch_data, key)
+def train_step_filtered(params, optimizer, opt_state, batch_data, key):
+    # Create a partial function that fixes forecast_ratio
+    def loss_partial(params):
+        return loss_fn(params, batch_data, key, forecast_ratio=0.3)
+    
+    loss_value, grads = eqx.filter_value_and_grad(loss_partial)(params)
     updates, opt_state = optimizer.update(grads, opt_state, params)
     params = optax.apply_updates(params, updates)
     return params, opt_state, loss_value
 
 # Validation function that also returns predictions
 @eqx.filter_jit
-def validation_step(params, static, batch_data, key):
+def validation_step(params, batch_data, key):
     model = eqx.combine(params, static)
-    # Always use 'all' strategy for evaluation - no special masking
-    input_data, mask_labels = create_forward_prediction_mask(batch_data, num_forward_steps, mask_strategy='all')
-    predictions = model(input_data, key=key)
-    # Create a config without weighted strategy for evaluation
-    eval_config = config().copy()
-    eval_config['MASK_STRATEGY'] = 'all'  # Ensure no weighting in evaluation loss
-    loss = compute_forecasting_loss(predictions=predictions, mask_labels=mask_labels, config=eval_config)
+    
+    # Use forecasting task for validation
+    # input_data, mask_labels = create_forward_prediction_mask(batch_data, num_forward_steps)
+    input_data, mask_labels = create_reconstruction_mask(
+        batch_data, key, mask_ratio=0.15, mode="full",
+        mask_token_ratio=0.8, use_zero_mask=False, max_spikes=max_spikes
+    )
+    
+    # Model computes loss internally
+    outputs = model.forward(input_data, mask_labels, key=key, val_phase=True)
+    
+    # Handle different return formats
+    if isinstance(outputs, tuple):
+        loss = outputs[0]
+        predictions = outputs[3] if len(outputs) > 3 else None  # decoder_rates is at index 3
+    else:
+        loss = outputs
+        predictions = None
+    
     return loss, predictions, mask_labels
 
-# Check if Metal is available
 import jax
-print(f"JAX backend: {jax.extend.backend.get_backend()}")
-print(f"Available devices: {jax.devices()}")
-print("Starting training...")
-print(f"Training MASK_STRATEGY: {config().get('MASK_STRATEGY', 'all')}")
-print(f"Evaluation: Always uses 'all' strategy (no special masking)")
-print("  - 'all': Train on all positions")
-print("  - 'weighted': All positions with 5x weight for spikes")
-print()
 
 for epoch in range(num_epochs):
     # Shuffle data at start of epoch
@@ -129,9 +161,6 @@ for epoch in range(num_epochs):
     shuffled_data = [train_data[i] for i in jr.permutation(shuffle_key, len(train_data))]
     
     # Force garbage collection at start of epoch
-    import gc
-    gc.collect()
-    
     epoch_loss = 0.0
     for batch_idx in range(num_batches):
         # Use data_loading_for_batch with shuffled data
@@ -140,12 +169,12 @@ for epoch in range(num_epochs):
         
         # Training step
         key, train_key = jr.split(key)
-        params, opt_state, loss_value = train_step_filtered(params, static, optimizer, opt_state, batch_data, train_key)
+        params, opt_state, loss_value = train_step_filtered(params, optimizer, opt_state, batch_data, train_key)
         epoch_loss += loss_value
         
         # Print progress every 50 batches
         if batch_idx % 50 == 0:
-            print(f"Epoch {epoch+1}/{num_epochs}, Batch {batch_idx+1}/{num_batches}, Loss: {loss_value:.4f}")
+            print(f"Epoch {epoch+1}/{num_epochs}, Batch {batch_idx+1}/{num_batches}, Loss: {loss_value.item():.4f}")
     
     avg_train_loss = epoch_loss / num_batches
     
@@ -161,81 +190,86 @@ for epoch in range(num_epochs):
         sample_matrix = process_sample_vectorized(it, t)
         val_batch_binned.append(sample_matrix)
     val_batch_data = jnp.array(val_batch_binned).astype(jnp.int32)
-    val_loss, predictions, mask_labels = validation_step(params, static, val_batch_data, val_key)
-    
-    # Extract predictions and ground truth for the forward timesteps
-    # Get the timesteps we're predicting (last num_forward_steps)
+    # Validation section
+    val_loss, predictions, mask_labels = validation_step(params, val_batch_data, val_key)
     context_length = val_batch_data.shape[1] - num_forward_steps
+    ground_truth = val_batch_data[:, context_length:, :]
     
-    # Ground truth for predicted timesteps
-    ground_truth = val_batch_data[:, context_length:, :]  # (batch, num_forward_steps, num_neurons)
-    
-    # Model predictions for those timesteps
-    pred_timesteps = predictions[:, context_length:, :]  # (batch, num_forward_steps, num_neurons)
-    
-    # Compute metrics
-    # With LOGRATE=True, predictions are log-rates, convert to rates for metrics
-    if config()['LOGRATE']:
-        pred_rates = jnp.exp(pred_timesteps)  # Convert log(λ) to λ
+    # Convert log-rates to rates, then to discrete spike counts
+    if predictions is not None:
+        if config()['LOGRATE']:
+            # Convert log-rates to rates
+            pred_rates = jnp.exp(predictions[:, context_length:, :])
+        else:
+            pred_rates = predictions[:, context_length:, :]
+        
+        # Convert rates to discrete spike counts (round to nearest integer)
+        pred_timesteps = jnp.round(pred_rates).astype(jnp.int32)
+        pred_timesteps = jnp.clip(pred_timesteps, 0, max_spikes)  # Clip to valid range
+        
+        #print out last forward steps of predictions and ground truth
+        print(f"Raw log-rates: {predictions[:2, context_length:, :3]}")  # Show first 2 samples, 3 neurons
+        print(f"Converted rates: {pred_rates[:2, :, :3]}")  # Show 3 neurons instead of 2
+        print(f"Final predictions: {pred_timesteps[:2, :, :3]}")  # Show 3 neurons instead of 2
     else:
-        pred_rates = pred_timesteps
+        pred_timesteps = None
+        pred_rates = None
+        print(f"Raw log-rates: None")
+        print(f"Converted rates: None") 
+        print(f"Final predictions: None")
+    print(f"Ground truth: {ground_truth[:2, :, :5]}")  # Show ground truth for 5 neurons
+
     
-    mae = jnp.mean(jnp.abs(pred_rates - ground_truth))
-    mse = jnp.mean((pred_rates - ground_truth) ** 2)
+    # Discrete metrics
+    accuracy = jnp.mean(pred_timesteps == ground_truth)
+    valid_mask = mask_labels[:, context_length:, :] != -1
+    masked_accuracy = jnp.sum((pred_timesteps == ground_truth) * valid_mask) / jnp.sum(valid_mask)
     
-    # Poisson NLL: E[λ - y*log(λ)]
-    poisson_nll = jnp.mean(pred_rates - ground_truth * jnp.log(pred_rates + 1e-8))
-    
-    # Count how many positions have spikes vs no spikes
-    num_spike_positions = jnp.sum(ground_truth > 0)
-    total_positions = ground_truth.size
-    spike_ratio = num_spike_positions / total_positions
+    # Confusion matrix (optional)
+    confusion = jnp.zeros((max_spikes + 1, max_spikes + 1))
+    for true_val in range(max_spikes + 1):
+        for pred_val in range(max_spikes + 1):
+            confusion = confusion.at[true_val, pred_val].set(
+                jnp.sum((ground_truth == true_val) & (pred_timesteps == pred_val))
+            )
     
     print(f"Epoch {epoch+1}/{num_epochs} completed:")
-    print(f"  Train Loss: {avg_train_loss:.4f}, Val Loss: {val_loss:.4f}")
-    print(f"  MAE: {mae:.4f}, MSE: {mse:.4f}, Poisson NLL: {poisson_nll:.4f}")
-    print(f"  Spike positions: {num_spike_positions}/{total_positions} ({spike_ratio:.2%})")
+    # Compute mean val loss if it's an array
+    val_loss_scalar = jnp.mean(val_loss) if val_loss.size > 1 else val_loss.item()
+    print(f"  Train Loss: {avg_train_loss:.4f}, Val Loss: {val_loss_scalar:.4f}")
+    print(f"  Accuracy: {accuracy.item():.4f}, Masked Accuracy: {masked_accuracy.item():.4f}")
     
     # Visualize predictions vs ground truth for first sample and first few neurons
     if epoch % 2 == 0 or epoch == num_epochs - 1:  # Plot every 2 epochs and final
         fig, axes = plt.subplots(3, 4, figsize=(16, 12))
         fig.suptitle(f'Predictions vs Ground Truth - Epoch {epoch+1}')
-        
+        timesteps = np.arange(num_forward_steps)
         for i, ax in enumerate(axes.flat):
             if i < min(12, ground_truth.shape[2]):  # Show up to 12 neurons or max available
                 # Plot ground truth
-                gt = ground_truth[0, :, i]  # First sample, all timesteps, neuron i
-                # Use converted rates for plotting
-                if config()['LOGRATE']:
-                    pred = jnp.exp(pred_timesteps[0, :, i])  # Convert log(λ) to λ
-                else:
-                    pred = pred_timesteps[0, :, i]
-                
-                timesteps = np.arange(num_forward_steps)
-                ax.plot(timesteps, gt, 'ko-', label='Ground Truth', markersize=8)
-                ax.plot(timesteps, pred, 'ro--', label='Prediction', markersize=6)
-                ax.set_xlabel('Future Timestep')
+                gt = ground_truth[0, :, i]
+                pred = pred_timesteps[0, :, i]  # Already integers!
+
+                # For discrete data, use step plot
+                ax.step(timesteps, gt, 'k-', where='mid', label='Ground Truth', linewidth=2)
+                ax.step(timesteps, pred, 'r--', where='mid', label='Prediction', linewidth=2)
+
+                # Set y-axis to integer values only
+                ax.set_ylim(-0.5, max_spikes + 0.5)
+                ax.set_yticks(range(max_spikes + 1))
+                ax.set_xlabel('Time Step')
                 ax.set_ylabel('Spike Count')
-                ax.set_title(f'Neuron {i}')
+                ax.set_title(f'Neuron {i+1}')
                 ax.legend()
                 ax.grid(True, alpha=0.3)
-                
-                # Fix y-axis to always be 0 to 3
-                ax.set_ylim(0, 3)
+            else:
+                ax.axis('off')  # Hide unused subplots
         
         plt.tight_layout()
-        plt.savefig(f'predictions_epoch_{epoch+1}.png')
+        plt.savefig(f'predictions_epoch_{epoch+1}.png', dpi=150, bbox_inches='tight')
         plt.close()
         
-        # Also save raw predictions for later analysis
-        np.savez(f'predictions_epoch_{epoch+1}.npz',
-                 predictions=np.array(pred_rates),  # Save converted rates, not log-rates
-                 ground_truth=np.array(ground_truth),
-                 val_loss=float(val_loss),
-                 mae=float(mae),
-                 mse=float(mse))
     
-    print()
 
 # Reconstruct final model
 final_model = eqx.combine(params, static)
