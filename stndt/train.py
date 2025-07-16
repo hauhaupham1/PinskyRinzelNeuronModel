@@ -41,13 +41,13 @@ def config():
         'LOSS': {
             'TYPE': 'poisson',  # Use Poisson NLL loss
         },
-        'LOGRATE': True,  # Work in log-rate space
+        'LOGRATE': False,  # Work in log-rate space
         'NUM_HEADS': 4,
         'DROPOUT': 0.1,
         'HIDDEN_SIZE': 128,
         'PRE_NORM': False,
         'FULL_CONTEXT': False,
-        'CONTEXT_FORWARD': 0,
+        'CONTEXT_FORWARD': -1,
         'CONTEXT_BACKWARD': -1,
         'MAX_SPIKES': max_spikes,
     }
