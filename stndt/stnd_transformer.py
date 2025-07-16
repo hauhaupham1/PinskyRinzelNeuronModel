@@ -612,15 +612,19 @@ class STNDT(eqx.Module):
         labels = jnp.concatenate([jnp.arange(batch_size) for i in range(self.n_views)], axis = 0)
         labels = (jnp.expand_dims(labels, 0) == jnp.expand_dims(labels, 1)).astype(jnp.float32)
 
-        features = jax_normalize(features, axis=1)
+        features = jax_normalize(features, dim=1)
         similarity_matrix = jnp.matmul(features, features.T)
 
-        mask = jnp.eye(labels.shape[0], dtype = jnp.bool)
-        labels = labels[~mask].reshape(labels.shape[0], -1)
-        similarity_matrix = similarity_matrix[~mask].reshape(similarity_matrix.shape[0], -1)
-
-        positives = similarity_matrix[labels == 1].reshape(labels.shape[0], -1)
-        negatives = similarity_matrix[labels == 0].reshape(similarity_matrix.shape[0], -1)
+        # Remove diagonal elements (self-similarities) - JAX compatible version
+        mask = jnp.eye(labels.shape[0], dtype=jnp.bool_)
+        
+        # Zero out diagonal elements instead of removing them
+        labels_masked = jnp.where(mask, 0, labels)
+        similarity_masked = jnp.where(mask, -jnp.inf, similarity_matrix)
+        
+        # For each row, find the positive similarity (where label=1) and negative similarities
+        positives = jnp.where(labels_masked == 1, similarity_masked, -jnp.inf).max(axis=1, keepdims=True)
+        negatives = jnp.where(labels_masked == 0, similarity_masked, -jnp.inf)
 
         logits = jnp.concatenate([positives, negatives], axis=1)
         labels = jnp.zeros(logits.shape[0], dtype=jnp.int64)
@@ -823,41 +827,73 @@ class STNDT(eqx.Module):
         decoder_output = jax.vmap(jax.vmap(self.src_decoder))(encoder_output)
 
         if contrast_src1 is not None and contrast_src2 is not None:
-            spatial_contrast1 = contrast_src1.transpose(2, 0, 1)        #BxTxN to NxBxT
-            spatial_contrast_embedded1 = self.spatial_embedder(spatial_contrast1) * self.spatial_scale
-            spatial_contrast1 = self.spatial_pos_encoder(spatial_contrast_embedded1)
+            spatial_contrast1 = contrast_src1.transpose(0, 2, 1)        #BxTxN to BxNxT
+            # Process spatial contrast with same method as main data
+            if self.config.get('LINEAR_EMBEDDER'):
+                spatial_contrast_embedded1 = jax.vmap(jax.vmap(self.spatial_embedder))(spatial_contrast1) * self.spatial_scale
+            elif self.config.get('EMBED_DIM') == 0:
+                spatial_contrast_embedded1 = jax.vmap(self.spatial_embedder)(spatial_contrast1) * self.spatial_scale
+            else:  # config.EMBED_DIM == 1
+                spatial_contrast_embedded1 = jax.vmap(jax.vmap(jax.vmap(self.spatial_embedder)))(spatial_contrast1)
+                spatial_contrast_embedded1 = spatial_contrast_embedded1.astype(jnp.float32) * self.spatial_scale
+                spatial_contrast_embedded1 = spatial_contrast_embedded1.squeeze(-1)
+            spatial_contrast1 = jax.vmap(self.spatial_pos_encoder)(spatial_contrast_embedded1)
 
             contrast_src1 = contrast_src1       # keep BxTxN format
-            contrast_src_embedded1 = self.embedder(contrast_src1) * self.scale
-            contrast_src1 = self.src_pos_encoder(contrast_src_embedded1)
+            # Process temporal contrast with same method as main data
+            if self.config.get('LINEAR_EMBEDDER'):
+                contrast_src_embedded1 = jax.vmap(jax.vmap(self.embedder))(contrast_src1) * self.scale
+            elif self.config.get('EMBED_DIM') == 0:
+                contrast_src_embedded1 = jax.vmap(self.embedder)(contrast_src1) * self.scale
+            else:  # config.EMBED_DIM == 1
+                contrast_src_embedded1 = jax.vmap(jax.vmap(jax.vmap(self.embedder)))(contrast_src1) * self.scale
+                contrast_src_embedded1 = contrast_src_embedded1.squeeze(-1)
+            contrast_src1 = jax.vmap(self.src_pos_encoder)(contrast_src_embedded1)
             contrast_mask1 = self._generate_context_mask(contrast_src1.shape[1])
             spatial_contrast_mask1 = None
 
             (
                 encoder_output_contrast1,
                 layer_outputs_contrast1,
-                _,_
+                layer_weights_contrast1,
+                _
             ) = self.encoder(contrast_src1, spatial_contrast1, contrast_mask1, spatial_contrast_mask1, **kwargs)
             encoder_output_contrast1 = self.rate_dropout(encoder_output_contrast1, key=subkey2) if not val_phase else self.rate_dropout(encoder_output_contrast1, inference=True)
 
-            spatial_contrast2 = contrast_src2.transpose(2, 0, 1)        #BxTxN to NxBxT
-            spatial_contrast_embedded2 = self.spatial_embedder(spatial_contrast2) * self.spatial_scale
-            spatial_contrast2 = self.spatial_pos_encoder(spatial_contrast_embedded2)
+            spatial_contrast2 = contrast_src2.transpose(0, 2, 1)        #BxTxN to BxNxT
+            # Process spatial contrast with same method as main data
+            if self.config.get('LINEAR_EMBEDDER'):
+                spatial_contrast_embedded2 = jax.vmap(jax.vmap(self.spatial_embedder))(spatial_contrast2) * self.spatial_scale
+            elif self.config.get('EMBED_DIM') == 0:
+                spatial_contrast_embedded2 = jax.vmap(self.spatial_embedder)(spatial_contrast2) * self.spatial_scale
+            else:  # config.EMBED_DIM == 1
+                spatial_contrast_embedded2 = jax.vmap(jax.vmap(jax.vmap(self.spatial_embedder)))(spatial_contrast2)
+                spatial_contrast_embedded2 = spatial_contrast_embedded2.astype(jnp.float32) * self.spatial_scale
+                spatial_contrast_embedded2 = spatial_contrast_embedded2.squeeze(-1)
+            spatial_contrast2 = jax.vmap(self.spatial_pos_encoder)(spatial_contrast_embedded2)
 
             contrast_src2 = contrast_src2       # keep BxTxN format
-            contrast_src_embedded2 = self.embedder(contrast_src2) * self.scale
-            contrast_src2 = self.src_pos_encoder(contrast_src_embedded2)
+            # Process temporal contrast with same method as main data
+            if self.config.get('LINEAR_EMBEDDER'):
+                contrast_src_embedded2 = jax.vmap(jax.vmap(self.embedder))(contrast_src2) * self.scale
+            elif self.config.get('EMBED_DIM') == 0:
+                contrast_src_embedded2 = jax.vmap(self.embedder)(contrast_src2) * self.scale
+            else:  # config.EMBED_DIM == 1
+                contrast_src_embedded2 = jax.vmap(jax.vmap(jax.vmap(self.embedder)))(contrast_src2) * self.scale
+                contrast_src_embedded2 = contrast_src_embedded2.squeeze(-1)
+            contrast_src2 = jax.vmap(self.src_pos_encoder)(contrast_src_embedded2)
             contrast_mask2 = self._generate_context_mask(contrast_src2.shape[1])
             spatial_contrast_mask2 = None
             (
                 encoder_output_contrast2,
                 layer_outputs_contrast2,
-                _,_
+                layer_weights_contrast2,
+                _
             ) = self.encoder(contrast_src2, spatial_contrast2, contrast_mask2, spatial_contrast_mask2, **kwargs)
             encoder_output_contrast2 = self.rate_dropout(encoder_output_contrast2, key=subkey3) if not val_phase else self.rate_dropout(encoder_output_contrast2, inference=True)
 
-            decoder_output_contrast1 = self.src_decoder(encoder_output_contrast1)
-            decoder_output_contrast2 = self.src_decoder(encoder_output_contrast2)
+            decoder_output_contrast1 = jax.vmap(jax.vmap(self.src_decoder))(encoder_output_contrast1)
+            decoder_output_contrast2 = jax.vmap(jax.vmap(self.src_decoder))(encoder_output_contrast2)
 
             if self.config.get('CONTRAST_LAYER') == 'embedder':
                 out1 = contrast_src_embedded1
@@ -870,9 +906,9 @@ class STNDT(eqx.Module):
                 out2 = layer_outputs_contrast2[self.config.get('CONTRAST_LAYER')]
 
             # Apply projector and flatten (no permute needed - keep BxTxN format)
-            out1 = self.projector(out1)  # Still (B, T, N)
+            out1 = jax.vmap(jax.vmap(self.projector))(out1)  # Still (B, T, N)
             out1 = out1.reshape(out1.shape[0], -1)  # (B, T, N) → (B, T*N)
-            out2 = self.projector(out2)  # Still (B, T, N)  
+            out2 = jax.vmap(jax.vmap(self.projector))(out2)  # Still (B, T, N)  
             out2 = out2.reshape(out2.shape[0], -1)  # (B, T, N) → (B, T*N)
             
             # Combine for InfoNCE loss
