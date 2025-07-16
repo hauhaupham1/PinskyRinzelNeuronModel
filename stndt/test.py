@@ -9,10 +9,10 @@ import jax.numpy as jnp
 
 def config():
     return{
-        'EMBED_DIM': 0,
-        'LINEAR_EMBEDDER': True,
-        'USE_CONTRAST_PROJECTOR': True,
-        'LINEAR_PROJECTOR' : True,
+        'EMBED_DIM': 1,
+        'LINEAR_EMBEDDER': False,
+        'USE_CONTRAST_PROJECTOR': False,
+        'LINEAR_PROJECTOR' : False,
         'DROPOUT_RATES': 0.1,
         'SCALE_NORM': True,
         'NUM_LAYERS': 3,
@@ -24,25 +24,28 @@ def config():
         'DROPOUT': 0.1,
         'HIDDEN_SIZE': 16,
         'PRE_NORM': False,  # Add this to match PyTorch
-        'LOGRATE': True, 
+        'MAX_SPIKES': 5,  # Set max spikes to match data range
     }
 
 
 key = jr.PRNGKey(0)
-stndt = STNDT(config=config(), trial_length=100, num_neurons=10, max_spikes=5, key=key)  # max_spikes=5 to match data range 0-5
+trial_length = 10  # Match the data time dimension
+stndt = STNDT(config=config(), trial_length=trial_length, num_neurons=10, key=key)  # max_spikes=5 to match data range 0-5
 
 
 
 #data format B x T x N - discrete spike counts
 # Generate realistic discrete spike counts (0-5 spikes per bin)
 key = jr.PRNGKey(42)
-data = jr.randint(key, (2, 100, 10), 0, 6)  # Random integers 0-5 representing spike counts
+data = jr.randint(key, (2, trial_length, 10), 0, 2)  # Random integers 0-5 representing spike counts
 
 print("Data shape:", data.shape)
 print("Data range:", data.min(), "to", data.max())
-print("Sample data:", data[0, :5, :5])  # Show first 5 time steps, 5 neurons of first batch
+print("Sample data:", data)  # Show first 5 time steps, 5 neurons of first batch
 
-result = stndt(data)
+result = stndt(data, training=False)
 
 print(result.shape)  # Should print the shape of the output tensor
-print(result)  # Print the output tensor to verify the result
+print(result[:, -5:, :])  # Print the output tensor to verify the result
+
+
