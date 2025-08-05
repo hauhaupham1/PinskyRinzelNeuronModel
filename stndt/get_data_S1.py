@@ -1,12 +1,12 @@
-import jax
+import jax.random as jr
 import jax.numpy as jnp
 import numpy as np
 from datasets import load_dataset
 
 # jnp.set_printoptions(threshold=jnp.inf)
 
-trial_length = 1000 
-bin_size = 8
+trial_length = 1000
+bin_size = 40  # Changed from 8ms to 20ms for better class balance
 num_time_bins = trial_length // bin_size
 num_neurons = 11
 
@@ -77,3 +77,44 @@ def data_loading_for_batch(train_data, batch_size = 128, batch_idx=0):
 # train_data, test_data = load_s1_data()
 # first_batch = data_loading_for_batch(train_data, batch_size=128, batch_idx=0)
 # print("Second sample:", first_batch[0])  # Print the second sample in the
+
+def find_max_spikes_from_data(train_data, test_data=None, sample_size=None):
+    """
+    Find the maximum spike count in the dataset
+    
+    Args:
+        train_data: Training data list
+        test_data: Optional test data list  
+        sample_size: If provided, only check this many samples (for speed)
+    """
+    max_spike_count = 0
+    
+    # Sample from train data if sample_size specified
+    data_to_check = train_data
+    if sample_size and sample_size < len(train_data):
+        indices = jr.choice(jr.PRNGKey(0), len(train_data), (sample_size,), replace=False)
+        data_to_check = [train_data[i] for i in indices]
+    
+    # Check train data
+    for it, t in data_to_check:
+        sample_matrix = process_sample_vectorized(it, t)
+        max_in_sample = jnp.max(sample_matrix)
+        max_spike_count = max(max_spike_count, int(max_in_sample))
+    
+    # Also check test data if provided
+    if test_data:
+        test_to_check = test_data[:min(1000, len(test_data))]  # Check first 1000 test samples
+        for it, t in test_to_check:
+            sample_matrix = process_sample_vectorized(it, t)
+            max_in_sample = jnp.max(sample_matrix)
+            max_spike_count = max(max_spike_count, int(max_in_sample))
+    
+    return max_spike_count
+
+
+# train_data = load_s1_train()
+# test_data = load_s1_test()
+# max_spikes = find_max_spikes_from_data(train_data, test_data)
+
+
+# print(f"Max spikes in dataset: {max_spikes}")

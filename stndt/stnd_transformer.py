@@ -497,7 +497,7 @@ class STNDT(eqx.Module):
         self.scale = math.sqrt(self.get_factor_size())
         self.spatial_scale = math.sqrt(self.get_factor_size(spatial=True))
         self.src_pos_encoder = PositionalEncoding(config, self.trial_length, self.get_factor_size(), key=keys[2])
-        self.spatial_pos_encoder = PositionalEncoding(config, self.num_neurons, self.trial_length, key=keys[3])
+        self.spatial_pos_encoder = PositionalEncoding(config, self.get_factor_size(), self.trial_length, key=keys[3])
     
         if config.get('USE_CONTRAST_PROJECTOR'):
             if config.get('LINEAR_PROJECTOR'):
@@ -548,6 +548,7 @@ class STNDT(eqx.Module):
         
         if config.get('LOSS').get('TYPE') == 'poisson':
             src_decoder_layers_keys = jr.split(keys[7], 2)
+            src_decoder_layers = []
             if config.get('DECODER', {}).get('LAYERS', 1) == 1:
                 # Single layer decoder - custom initialization
                 weight_shape = (self.get_factor_size(), self.num_neurons)
@@ -557,10 +558,10 @@ class STNDT(eqx.Module):
                 # Create decoder with custom weights
                 decoder = eqx.nn.Linear(self.get_factor_size(), self.num_neurons, key=src_decoder_layers_keys[0])
                 decoder = eqx.tree_at(lambda m: (m.weight, m.bias), decoder, (weight, bias))
-                self.src_decoder = decoder
+                src_decoder_layers.append(decoder)
+                self.src_decoder = eqx.nn.Sequential(src_decoder_layers)
             else:
                 # Multi-layer decoder
-                src_decoder_layers = []
                 
                 # Apply custom initialization to FIRST layer (matching PyTorch)
                 first_layer = eqx.nn.Linear(self.get_factor_size(), 16, key=src_decoder_layers_keys[0])
