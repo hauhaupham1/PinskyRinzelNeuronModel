@@ -78,7 +78,6 @@ class AttentionBlock(eqx.Module):
     def __call__(
         self,
         inputs: Float[Array, "seq_len hidden_size"],
-        mask: Int[Array, " seq_len"] | None,
         enable_dropout: bool = False,
         key: "jax.random.PRNGKey" = None,
     ) -> Float[Array, "seq_len hidden_size"]:
@@ -93,8 +92,9 @@ class AttentionBlock(eqx.Module):
             key_heads = jax.vmap(self.rope, in_axes=1, out_axes=1)(key_heads)
             return query_heads, key_heads, value_heads
 
-        if mask is not None:
-            mask = self.make_self_attention_mask(mask)
+        seq_len = inputs.shape[0]
+        mask = self.make_causal_mask(seq_len)
+        print("Mask: ", mask)
         attention_key, dropout_key = (
             (None, None) if key is None else jax.random.split(key)
         )
@@ -109,22 +109,21 @@ class AttentionBlock(eqx.Module):
             process_heads=process_heads,
         )
 
+        print("Attention: ", attention_output)
+
         result = attention_output
         result = self.dropout(result, inference=not enable_dropout, key=dropout_key)
         result = result + inputs
         result = jax.vmap(self.layernorm)(result)
         return result
 
-    def make_self_attention_mask(
-        self, mask: Int[Array, " seq_len"]
-    ) -> Float[Array, "num_heads seq_len seq_len"]:
-        """Create self-attention mask from sequence-level mask."""
-        mask = jnp.multiply(
-            jnp.expand_dims(mask, axis=-1), jnp.expand_dims(mask, axis=-2)
-        )
-        mask = jnp.expand_dims(mask, axis=-3)
-        mask = jnp.repeat(mask, repeats=self.num_heads, axis=-3)
-        return mask.astype(jnp.float32)
+    
+
+    def make_causal_mask(self, seq_len: int) -> Float[Array, "seq_len seq_len"]:
+        # Create lower triangular causal mask
+        # True = can attend, False = mask out (Equinox convention)
+        causal_mask = jnp.tril(jnp.ones((seq_len, seq_len), dtype=bool))
+        return causal_mask
 
 
 
@@ -163,7 +162,6 @@ class TransformerLayer(eqx.Module):
     def __call__(
             self, 
             inputs: Float[Array, "seq_len hidden_size"],
-            mask: Int[Array, "seq_len"] | None = None,
             *,
             enable_dropout: bool = False,
             key: "jax.random.PRNGKey | None" = None,
@@ -171,7 +169,6 @@ class TransformerLayer(eqx.Module):
         attn_key, ff_key = (None, None) if key is None else jr.split(key)
         attention_output = self.attention_block(
             inputs=inputs,
-            mask=mask,
             enable_dropout=enable_dropout,
             key=attn_key,
         )
@@ -213,7 +210,6 @@ class EncoderBlock(eqx.Module):
     def __call__(
         self, 
         inputs: Float[Array, "seq_len hidden_size"],
-        mask: Int[Array, "seq_len"] | None = None,
         *,
         enable_dropout: bool = False,
         key: "jax.random.PRNGKey | None" = None,
@@ -223,7 +219,6 @@ class EncoderBlock(eqx.Module):
         for i, layer in enumerate(self.layers):
             inputs = layer(
                 inputs=inputs,
-                mask=mask,
                 enable_dropout=enable_dropout,
                 key=None if keys is None else keys[i],
             )
@@ -253,7 +248,7 @@ class Transformer(eqx.Module):
             in_features=input_dim,
             out_features=hidden_size,
             key=input_proj_key,
-            )
+        )
         
         self.encoder = EncoderBlock(
             hidden_size=hidden_size,
@@ -277,21 +272,18 @@ class Transformer(eqx.Module):
     def __call__(
         self,
         inputs: Float[Array, "batch seq_len input_dim"],
-        mask : Int[Array, "seq_len"] | None = None,
         *,
         enable_dropout: bool = False,
         key: "jax.random.PRNGKey | None" = None,
     ) -> Float[Array, "batch seq_len input_dim"]:
         
-        input_dim = inputs.shape[-1]
         batch_size = inputs.shape[0]
         inputs = jax.vmap(jax.vmap(self.input_proj))(inputs)
         if key is not None:
             key = jr.split(key, num=batch_size)
-            outputs = jax.vmap(lambda x, k: self.encoder(x, mask=mask, enable_dropout=enable_dropout, key=k), in_axes=(0, 0))(inputs, key)
+            outputs = jax.vmap(lambda x, k: self.encoder(x, enable_dropout=enable_dropout, key=k), in_axes=(0, 0))(inputs, key)
         else:
-            outputs = jax.vmap(lambda x: self.encoder(x, mask=mask, enable_dropout=enable_dropout, key=None))(inputs)
-        
+            outputs = jax.vmap(lambda x: self.encoder(x, enable_dropout=enable_dropout, key=None))(inputs)
         
         outputs = jax.vmap(jax.vmap(self.output_proj))(outputs)
         outputs = jax.vmap(jax.vmap(self.activation))(outputs)
@@ -301,19 +293,20 @@ class Transformer(eqx.Module):
 
 #######TESTING CODE#######
 
-# transformer = Transformer(
-#     input_dim=5,
-#     hidden_size=64,
-#     intermediate_size=128,
-#     num_heads=8,
-#     num_layers=4,
-#     dropout_rate=0.1,
-#     attention_dropout_rate=0.1,
-#     key=jax.random.PRNGKey(42)
-# )
+transformer = Transformer(
+    input_dim=5,
+    hidden_size=64,
+    intermediate_size=128,
+    num_heads=8,
+    num_layers=4,
+    dropout_rate=0.1,
+    attention_dropout_rate=0.1,
+    key=jax.random.PRNGKey(42)
+)
 
-# #dummny data
-# input = jr.uniform(jr.PRNGKey(0), (2, 5, 5))  # batch_size=2, seq_len=5, input_dim=5
-# output = transformer(input, enable_dropout=False, key=jax.random.PRNGKey(1))
-# print("Output shape:", output.shape)  # Should be (2, 5, 5)
-# print("Output:", output)  # Should print the output tensor
+#dummny data
+input = jr.uniform(jr.PRNGKey(0), (2, 3, 5))  # batch_size=2, seq_len=5, input_dim=5
+print("Input: ", input)
+output = transformer(input, enable_dropout=False, key=jax.random.PRNGKey(1))
+print("Output shape:", output.shape)  # Should be (2, 5, 5)
+print("Output:", output)  # Should print the output tensor
