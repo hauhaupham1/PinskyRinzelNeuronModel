@@ -1,3 +1,5 @@
+#Adapted from STNDT, Trung Le.
+
 import equinox as eqx
 import jax.numpy as jnp
 import jax.random as jr
@@ -244,13 +246,14 @@ class TransformerLayer(eqx.Module):
             enable_dropout: bool = False,
             key: "jax.random.PRNGKey | None" = None,
     ) -> Float[Array, "seq_len hidden_size"]:
-        attn_key, ff_key = (None, None) if key is None else jr.split(key)
+        attn_key, ff_key, ff_key2 = (None, None) if key is None else jr.split(key, 3)
         attention_output = self.attention_block(
             inputs=inputs,
             enable_dropout=enable_dropout,
             key=attn_key,
         )
         seq_len = inputs.shape[0]
+        # hidden_size = inputs.shape[1]
         ff_keys = None if key is None else jr.split(ff_key, num=seq_len)
         output_ff = jax.vmap(self.ff_block, in_axes=(0, None, 0))(
             attention_output, enable_dropout, ff_keys
@@ -258,14 +261,17 @@ class TransformerLayer(eqx.Module):
 
         #spatial weight
         spatial_input = inputs.T
-        # print(f"Input shape after transpose: {spatial_input.shape}")
         spatial_weight = self.spatial_attention_block(inputs=spatial_input)
 
-        output = jnp.matmul(output_ff, spatial_weight)
+        # print(f"spatial weight shape: {spatial_weight.shape}")
+        # print(f"output ff tranposed shape: {output_ff.T.shape}")
+
+        output = jnp.matmul(spatial_weight, output_ff.T).T
 
         #ff2
+        ff_keys2 = None if key is None else jr.split(ff_key2, num=seq_len)
         output_ff2 = jax.vmap(self.ff_block2, in_axes=(0, None, 0))(
-            output, enable_dropout, ff_keys
+            output, enable_dropout, ff_keys2
         )
 
         return output_ff2
@@ -389,9 +395,9 @@ class Transformer(eqx.Module):
 #######TESTING CODE#######
 
 model = Transformer(
-    input_dim=1,
+    input_dim=5,
     hidden_size=16,
-    trial_length=4,
+    trial_length=3,
     intermediate_size=128,
     num_heads=8,
     num_layers=4,
@@ -401,7 +407,7 @@ model = Transformer(
 )
 
 #dummny data
-input = jr.uniform(jr.PRNGKey(0), (2, 4, 1))  # batch_size=2, seq_len=5, input_dim=5
+input = jr.uniform(jr.PRNGKey(0), (2, 3, 5))  # batch_size=2, seq_len=5, input_dim=5
 print("Input: ", input)
 output = model(input, enable_dropout=True, key=jax.random.PRNGKey(1))
 print("Output shape:", output.shape)  # Should be (2, 5, 5)
