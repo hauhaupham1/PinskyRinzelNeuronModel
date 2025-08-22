@@ -4,9 +4,15 @@ Pinsky-Rinzel Motoneuron Network Implementation
 Credits:
     - paths implementation by Christian Holberg
 """
+
 from typing import Optional
 
-from diffrax import AbstractPath, BrownianIncrement, SpaceTimeLevyArea, VirtualBrownianTree
+from diffrax import (
+    AbstractPath,
+    BrownianIncrement,
+    SpaceTimeLevyArea,
+    VirtualBrownianTree,
+)
 from diffrax._brownian.tree import _levy_diff, _make_levy_val
 from diffrax._custom_types import RealScalarLike, levy_tree_transpose
 from diffrax._misc import linear_rescale
@@ -19,7 +25,9 @@ from typing import Literal, Optional, Tuple, Union
 import jax.tree_util as jtu
 from typing_extensions import TypeAlias
 from .solution import Solution
+
 _Spline: TypeAlias = Literal["sqrt", "quad", "zero"]
+
 
 def plottable_paths(
     sol: Solution,
@@ -104,7 +112,7 @@ def interleave(arr1: Array, arr2: Array) -> Array:
 #     out = out.at[0, :].set(jnp.insert(jnp.zeros(num_neurons), 0, t0))
 #     # time_capped = jnp.where(out[:, 0] < t1, out[:, 0], last_spike_time)
 #     # out = out.at[:, 0].set(time_capped)
-    
+
 #     # Fix for shape consistency: truncate or pad to max_length if specified
 #     if max_length is not None:
 #         current_length = out.shape[0]
@@ -117,8 +125,9 @@ def interleave(arr1: Array, arr2: Array) -> Array:
 #             padding_needed = max_length - current_length
 #             padding = jnp.tile(last_row, (padding_needed, 1))
 #             out = jnp.vstack([out, padding])
-    
+
 #     return out
+
 
 def marcus_lift(
     t0: RealScalarLike,
@@ -141,7 +150,9 @@ def marcus_lift(
     - An array of shape `(2 * max_spikes, num_neurons + 1)` representing the Marcus lift.
     """
     num_neurons = spike_mask.shape[1]
-    finite_spikes = jnp.where(jnp.isfinite(spike_times), spike_times, t1).reshape((-1, 1))
+    finite_spikes = jnp.where(jnp.isfinite(spike_times), spike_times, t1).reshape(
+        (-1, 1)
+    )
     spike_cumsum = jnp.cumsum(spike_mask, axis=0)
     # last_spike_time = jnp.max(jnp.where(spike_times < t1, spike_times, -jnp.inf))
     spike_cumsum_shift = jnp.roll(spike_cumsum, 1, axis=0)
@@ -157,6 +168,7 @@ def marcus_lift(
     # time_capped = jnp.where(out[:, 0] < t1, out[:, 0], last_spike_time)
     # out = out.at[:, 0].set(time_capped)
     return out
+
 
 @eqx.filter_jit
 def cap_fill_ravel(ts, ys, spike_cap=10):
@@ -220,16 +232,21 @@ class SpikeTrain(AbstractPath):
         self.num_spikes = spike_times.shape[0]
         self.spike_times = jnp.insert(spike_times, 0, t0)
         self.spike_cumsum = jnp.cumsum(
-            jnp.insert(spike_mask, 0, jnp.full_like(spike_mask[0], False), axis=0), axis=0
+            jnp.insert(spike_mask, 0, jnp.full_like(spike_mask[0], False), axis=0),
+            axis=0,
         )
 
-    def evaluate(self, t0: Real, t1: Optional[Real] = None, left: Optional[bool] = True) -> Array:
+    def evaluate(
+        self, t0: Real, t1: Optional[Real] = None, left: Optional[bool] = True
+    ) -> Array:
         del left
         if t1 is not None:
             return self.evaluate(t1 - t0)
         idx = jnp.searchsorted(self.spike_times, t0)
         idx = jnp.where(idx > 0, idx - 1, idx)
-        out = jax.lax.dynamic_slice(self.spike_cumsum, (idx, 0), (self.num_neurons, 1))[:, 0]
+        out = jax.lax.dynamic_slice(self.spike_cumsum, (idx, 0), (self.num_neurons, 1))[
+            :, 0
+        ]
         return out
 
 
@@ -238,7 +255,9 @@ class SingleSpikeTrain(AbstractPath):
     t1: Real
     spike_times: Array
 
-    def evaluate(self, t0: Real, t1: Optional[Real] = None, left: Optional[bool] = True) -> Array:
+    def evaluate(
+        self, t0: Real, t1: Optional[Real] = None, left: Optional[bool] = True
+    ) -> Array:
         del left
         if t1 is not None:
             return self.evaluate(t1 - t0)
@@ -255,7 +274,9 @@ class BrownianPath(VirtualBrownianTree):
         tol: RealScalarLike,
         shape: Union[tuple[int, ...], PyTree[jax.ShapeDtypeStruct]],
         key: PRNGKeyArray,
-        levy_area: type[Union[BrownianIncrement, SpaceTimeLevyArea]] = BrownianIncrement,
+        levy_area: type[
+            Union[BrownianIncrement, SpaceTimeLevyArea]
+        ] = BrownianIncrement,
         _spline: _Spline = "sqrt",
     ):
         super().__init__(t0, t1, tol, shape, key, levy_area, _spline)

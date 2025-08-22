@@ -5,10 +5,11 @@ from datasets import load_dataset
 
 # jnp.set_printoptions(threshold=jnp.inf)
 
-trial_length = 1000 
+trial_length = 1000
 bin_size = 8
 num_time_bins = trial_length // bin_size
 num_neurons = 11
+
 
 def load_s1_train():
     dataset = load_dataset("livn-org/livn", name="S1")
@@ -22,6 +23,7 @@ def load_s1_train():
 
     return train_data
 
+
 def load_s1_test():
     dataset = load_dataset("livn-org/livn", name="S1")
     test_data = []
@@ -32,19 +34,26 @@ def load_s1_test():
 
     return test_data
 
+
 def process_sample_vectorized(it, t):
     it = jnp.array(it)
     t = jnp.array(t)
     bin_indices = (t // bin_size).astype(int)
 
-    valid_mask = (bin_indices >= 0) & (bin_indices < num_time_bins) & (it >= 0) & (it < num_neurons)
+    valid_mask = (
+        (bin_indices >= 0)
+        & (bin_indices < num_time_bins)
+        & (it >= 0)
+        & (it < num_neurons)
+    )
     valid_bins = bin_indices[valid_mask]
     valid_neurons = it[valid_mask]
 
     sample_matrix = jnp.zeros((num_time_bins, num_neurons))
     return sample_matrix.at[valid_bins, valid_neurons].add(1)
 
-#loading all data at once
+
+# loading all data at once
 # def preprocess_data(train_data, test_data):
 #     processed_train = []
 #     processed_test = []
@@ -61,8 +70,7 @@ def process_sample_vectorized(it, t):
 #     return jnp.array(processed_train), jnp.array(processed_test)
 
 
-
-def data_loading_for_batch(train_data, batch_size = 128, batch_idx=0):
+def data_loading_for_batch(train_data, batch_size=128, batch_idx=0):
     start_idx = batch_idx * batch_size
     end_idx = min(start_idx + batch_size, len(train_data))
     batch_indices = range(start_idx, end_idx)
@@ -73,6 +81,7 @@ def data_loading_for_batch(train_data, batch_size = 128, batch_idx=0):
         batch_binned.append(sample_matrix)
     batch_binned = jnp.array(batch_binned)
     return batch_binned
+
 
 # train_data, test_data = load_s1_data()
 # first_batch = data_loading_for_batch(train_data, batch_size=128, batch_idx=0)

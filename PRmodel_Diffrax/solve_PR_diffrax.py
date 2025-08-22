@@ -3,93 +3,81 @@ import jax.numpy as jnp
 from diffrax import diffeqsolve, ODETerm, Dopri5, SaveAt
 
 
-def solve_PRmodel_diffrax(
-    t_dur, 
-    g_c, 
-    I_stim, 
-    stim_start, 
-    stim_end    
-    ):
-    #Model parameters
-    C_m = 3.     # membrane capacitance [uF cm**-2]
-    p = 0.5      # proportion of the membrane area taken up by the soma
+def solve_PRmodel_diffrax(t_dur, g_c, I_stim, stim_start, stim_end):
+    # Model parameters
+    C_m = 3.0  # membrane capacitance [uF cm**-2]
+    p = 0.5  # proportion of the membrane area taken up by the soma
 
-    g_L = 0.1    # [mS cm**-2]
-    g_Na = 30.   # [mS cm**-2]
-    g_DR = 15.   # [mS cm**-2]
-    g_Ca = 10.   # [mS cm**-2]
+    g_L = 0.1  # [mS cm**-2]
+    g_Na = 30.0  # [mS cm**-2]
+    g_DR = 15.0  # [mS cm**-2]
+    g_Ca = 10.0  # [mS cm**-2]
     g_AHP = 0.8  # [mS cm**-2]
-    g_C = 15.    # [mS cm**-2]
+    g_C = 15.0  # [mS cm**-2]
 
-    E_L = -68.   # [mV]
-    E_Na = 60.   # [mV]
-    E_K = -75.   # [mV]
-    E_Ca = 80.   # [mV]
+    E_L = -68.0  # [mV]
+    E_Na = 60.0  # [mV]
+    E_K = -75.0  # [mV]
+    E_Ca = 80.0  # [mV]
 
     def alpha_m(Vs):
         V1 = Vs + 46.9
-        alpha = -0.32 * V1 / (jnp.exp(V1 / 4.) - 1.)
+        alpha = -0.32 * V1 / (jnp.exp(V1 / 4.0) - 1.0)
         return alpha
-    
+
     def beta_m(Vs):
         V2 = Vs + 19.9
-        beta = 0.28 * V2 / (jnp.exp(V2 / 5.) - 1.)
+        beta = 0.28 * V2 / (jnp.exp(V2 / 5.0) - 1.0)
         return beta
 
     def alpha_h(Vs):
-        alpha = 0.128 * jnp.exp((-43. - Vs) / 18.)
+        alpha = 0.128 * jnp.exp((-43.0 - Vs) / 18.0)
         return alpha
 
     def beta_h(Vs):
-        V5 = Vs + 20.
-        beta = 4. / (1 + jnp.exp(-V5 / 5.))
+        V5 = Vs + 20.0
+        beta = 4.0 / (1 + jnp.exp(-V5 / 5.0))
         return beta
 
     def alpha_n(Vs):
         V3 = Vs + 24.9
-        alpha = -0.016 * V3 / (jnp.exp(-V3 / 5.) - 1)
+        alpha = -0.016 * V3 / (jnp.exp(-V3 / 5.0) - 1)
         return alpha
 
     def beta_n(Vs):
-        V4 = Vs + 40.
-        beta = 0.25 * jnp.exp(-V4 / 40.)
+        V4 = Vs + 40.0
+        beta = 0.25 * jnp.exp(-V4 / 40.0)
         return beta
 
     def alpha_s(Vd):
-        alpha = 1.6 / (1 + jnp.exp(-0.072 * (Vd-5.)))
+        alpha = 1.6 / (1 + jnp.exp(-0.072 * (Vd - 5.0)))
         return alpha
 
     def beta_s(Vd):
         V6 = Vd + 8.9
-        beta = 0.02 * V6 / (jnp.exp(V6 / 5.) - 1.)
+        beta = 0.02 * V6 / (jnp.exp(V6 / 5.0) - 1.0)
         return beta
 
     def alpha_c(Vd):
         V7 = Vd + 53.5
-        V8 = Vd + 50.
+        V8 = Vd + 50.0
         return jnp.where(
-            Vd <= -10,
-            0.0527 * jnp.exp(V8/11. - V7/27.),
-            2 * jnp.exp(-V7 / 27.)
+            Vd <= -10, 0.0527 * jnp.exp(V8 / 11.0 - V7 / 27.0), 2 * jnp.exp(-V7 / 27.0)
         )
 
     def beta_c(Vd):
         V7 = Vd + 53.5
         alpha_c_val = alpha_c(Vd)
-        return jnp.where(
-            Vd <= -10,
-            2. * jnp.exp(-V7 / 27.) - alpha_c_val,
-            0.
-        )
+        return jnp.where(Vd <= -10, 2.0 * jnp.exp(-V7 / 27.0) - alpha_c_val, 0.0)
 
     def alpha_q(Ca):
-        return jnp.minimum(0.00002*Ca, 0.01)
+        return jnp.minimum(0.00002 * Ca, 0.01)
 
     def beta_q(Ca):
         return 0.001
 
     def chi(Ca):
-        return jnp.minimum(Ca/250., 1.)
+        return jnp.minimum(Ca / 250.0, 1.0)
 
     def m_inf(Vs):
         return alpha_m(Vs) / (alpha_m(Vs) + beta_m(Vs))
@@ -97,35 +85,35 @@ def solve_PRmodel_diffrax(
     # Define the vector field for diffrax (equivalent to dVdt in the original)
     def vector_field(t, y, args):
         Vs, Vd, n, h, s, c, q, Ca = y
-        
-        I_leak_s = g_L*(Vs - E_L)
-        I_leak_d = g_L*(Vd - E_L)
-        I_Na = g_Na * m_inf(Vs)**2 * h * (Vs - E_Na)
+
+        I_leak_s = g_L * (Vs - E_L)
+        I_leak_d = g_L * (Vd - E_L)
+        I_Na = g_Na * m_inf(Vs) ** 2 * h * (Vs - E_Na)
         I_DR = g_DR * n * (Vs - E_K)
         I_ds = g_c * (Vd - Vs)
-        
+
         I_Ca = g_Ca * s**2 * (Vd - E_Ca)
         I_AHP = g_AHP * q * (Vd - E_K)
-        I_C = g_C * c * chi(Ca) * (Vd - E_K)    
-        I_sd = -I_ds 
-        
+        I_C = g_C * c * chi(Ca) * (Vd - E_K)
+        I_sd = -I_ds
+
         # Apply stimulus using jax's where for conditional logic
-        stimulus = jnp.where((t > stim_start) & (t < stim_end), I_stim/p, 0.0)
-        
-        dVsdt = (1./C_m) * (-I_leak_s - I_Na - I_DR + I_ds/p + stimulus)
-        dVddt = (1./C_m) * (-I_leak_d - I_Ca - I_AHP - I_C + I_sd/(1-p))
-        dhdt = alpha_h(Vs)*(1-h) - beta_h(Vs)*h 
-        dndt = alpha_n(Vs)*(1-n) - beta_n(Vs)*n
-        dsdt = alpha_s(Vd)*(1-s) - beta_s(Vd)*s
-        dcdt = alpha_c(Vd)*(1-c) - beta_c(Vd)*c
-        dqdt = alpha_q(Ca)*(1-q) - beta_q(Ca)*q
-        dCadt = -0.13*I_Ca - 0.075*Ca
+        stimulus = jnp.where((t > stim_start) & (t < stim_end), I_stim / p, 0.0)
+
+        dVsdt = (1.0 / C_m) * (-I_leak_s - I_Na - I_DR + I_ds / p + stimulus)
+        dVddt = (1.0 / C_m) * (-I_leak_d - I_Ca - I_AHP - I_C + I_sd / (1 - p))
+        dhdt = alpha_h(Vs) * (1 - h) - beta_h(Vs) * h
+        dndt = alpha_n(Vs) * (1 - n) - beta_n(Vs) * n
+        dsdt = alpha_s(Vd) * (1 - s) - beta_s(Vd) * s
+        dcdt = alpha_c(Vd) * (1 - c) - beta_c(Vd) * c
+        dqdt = alpha_q(Ca) * (1 - q) - beta_q(Ca) * q
+        dCadt = -0.13 * I_Ca - 0.075 * Ca
 
         return jnp.array([dVsdt, dVddt, dndt, dhdt, dsdt, dcdt, dqdt, dCadt])
 
     # Initial conditions
-    Vs0 = -68.
-    Vd0 = -68.
+    Vs0 = -68.0
+    Vd0 = -68.0
     n0 = 0.001
     h0 = 0.999
     s0 = 0.009
@@ -136,13 +124,13 @@ def solve_PRmodel_diffrax(
 
     # Set up the ODE term
     term = ODETerm(vector_field)
-    
+
     # Solver
-    solver = Dopri5()  
-    
+    solver = Dopri5()
+
     # Configure save points
-    saveat = SaveAt(ts=jnp.linspace(0, t_dur, int(t_dur/0.05) + 1))
-    
+    saveat = SaveAt(ts=jnp.linspace(0, t_dur, int(t_dur / 0.05) + 1))
+
     # Solve the system
     sol = diffeqsolve(
         term,
@@ -152,7 +140,7 @@ def solve_PRmodel_diffrax(
         dt0=0.05,  # Initial step size
         y0=y0,
         saveat=saveat,
-        max_steps=None
+        max_steps=None,
     )
 
     return sol
