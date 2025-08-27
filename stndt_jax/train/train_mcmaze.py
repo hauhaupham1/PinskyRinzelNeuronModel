@@ -178,7 +178,32 @@ def eval_step(model: STNDT, batch, config):
     total_spikes = jnp.sum(jnp.where(valid_mask, batch, 0.0))
     # Bits per spike
     bps = (nll_null - nll_model) / total_spikes / jnp.log(2)
-    return bps, decoder_rates
+    
+    # Calculate R² score for masked positions
+    # Convert log-rates to rates if needed
+    if config.get("LOGRATE", False):
+        pred_rates = jnp.exp(decoder_rates)
+    else:
+        pred_rates = decoder_rates
+    
+    # Calculate R² using JAX-compatible operations (no boolean indexing)
+    # Use valid_mask to weight the calculations
+    
+    # Compute weighted mean of ground truth (only for valid positions)
+    valid_gt = jnp.where(valid_mask, batch, 0.0)
+    valid_pred = jnp.where(valid_mask, pred_rates, 0.0)
+    n_valid = jnp.sum(valid_mask)
+    gt_mean = jnp.sum(valid_gt) / n_valid
+    
+    # Calculate sum of squares for valid positions only
+    residuals = jnp.where(valid_mask, (batch - pred_rates) ** 2, 0.0)
+    total_var = jnp.where(valid_mask, (batch - gt_mean) ** 2, 0.0)
+    
+    ss_res = jnp.sum(residuals)
+    ss_tot = jnp.sum(total_var)
+    r2 = 1 - (ss_res / ss_tot)
+    
+    return bps, r2, pred_rates
 
 
 def visualize_batch(
@@ -248,8 +273,8 @@ if __name__ == "__main__":
         if i % 20 == 0:
             val_key = jrandom.PRNGKey(i)
             val_data = get_batch(data, batch_size=BATCH_SIZE, split="val", key=val_key)
-            bps, decoder_rates = eval_step(model, val_data, dynamic_config)
+            bps, r2, decoder_rates = eval_step(model, val_data, dynamic_config)
 
             
-            visualize_batch(decoder_rates, val_data, i, predictions_are_log_rates=config["LOGRATE"])
-            print(f"  Val bps: {bps}")
+            visualize_batch(decoder_rates, val_data, i, predictions_are_log_rates=False)
+            print(f"  Val bps: {bps:.4f}, R²: {r2:.4f}")
