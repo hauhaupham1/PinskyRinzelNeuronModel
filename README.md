@@ -1,3 +1,5 @@
+> ⚠️ **Note:** This repository has been merged into [livn](https://github.com/livn-org/livn) and is no longer actively maintained here.
+
 # The Pinsky-Rinzel Neuron Model and Network
 
 This is an implementation of the Pinsky-Rinzel model 
