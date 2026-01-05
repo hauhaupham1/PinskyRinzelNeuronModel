@@ -75,4 +75,4 @@ if __name__ == "__main__":
 The original code is from Marte Julie (https://github.com/CINPLA/PRmodel/blob/master/PRmodel/solve_PRmodel.py) and the code was further extended to include JAX/Diffrax implementations and network capabilities.
 
 paths.py and solution.py are from Cholberg's implementation: (https://github.com/cholberg/snnax)
-
+Rough Signals paper: https://arxiv.org/abs/2405.13587
