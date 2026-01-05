@@ -2,3 +2,4 @@
 stndt_jax/data_loading/data/000128/sub-Jenkins/sub-Jenkins_ses-full_desc-train_behavior+ecephys.nwb
 stndt_jax/data_loading/data/000128/sub-Jenkins/sub-Jenkins_ses-full_desc-test_ecephys.nwb
 .idea
+__pycache__
