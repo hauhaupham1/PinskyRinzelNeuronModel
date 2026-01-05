@@ -6,6 +6,8 @@ This is an implementation of the Pinsky-Rinzel model
 The code was used to produce some of the results presented
 in Sætra et al. 2020: [An electrodiffusive, ion conserving Pinsky-Rinzel model with homeostatic mechanisms](https://doi.org/10.1371/journal.pcbi.1007661
 ).
+
+This implementation extends the Pinsky-Rinzel model with adaptations for Motoneurons.
 ### Requirements
 - Python 3.6+
 - NumPy
